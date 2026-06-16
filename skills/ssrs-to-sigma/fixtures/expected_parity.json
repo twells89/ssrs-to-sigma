@@ -1,0 +1,10 @@
+{
+  "_comment": "Example Phase 5/6 expected-parity shape. Values come FROM SSRS rendered output (?rs:Format=CSV), never invented. Keys are the Tablix group columns; values are the measure cells. verify_parity.py joins Sigma's CSV export on keys and compares values (money/counts exact to a cent, ratios rel 1e-6). These illustrative numbers are NOT validated against a live system.",
+  "SalesByRegion/SalesMatrix": [
+    { "keys": { "RegionName": "East", "Category": "Bikes" },       "values": { "Value": 128450.00 } },
+    { "keys": { "RegionName": "East", "Category": "Accessories" }, "values": { "Value": 19320.50 } },
+    { "keys": { "RegionName": "West", "Category": "Bikes" },       "values": { "Value": 156200.00 } },
+    { "keys": { "RegionName": "West", "Category": "Accessories" }, "values": { "Value": 22890.75 } },
+    { "keys": { "RegionName": "Central", "Category": "Bikes" },    "values": { "Value": 98760.25 } }
+  ]
+}

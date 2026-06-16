@@ -1,0 +1,191 @@
+{
+  "version": 1,
+  "reports": [
+    {
+      "report": "SalesByRegion",
+      "sourceFile": "SalesByRegion.rdl",
+      "dataSources": [
+        {
+          "name": "SalesDW",
+          "reference": "/Data Sources/SalesDW",
+          "provider": "SQL",
+          "connectString": "Data Source=sql01;Initial Catalog=SalesDW"
+        }
+      ],
+      "dataSets": [
+        {
+          "name": "OrderFacts",
+          "dataSourceName": "SalesDW",
+          "commandText": "SELECT o.OrderDate, r.RegionName, p.Category, o.SalesAmount, o.OrderQty\nFROM dbo.OrderFact o\nJOIN dbo.DimRegion r ON o.RegionKey = r.RegionKey\nJOIN dbo.DimProduct p ON o.ProductKey = p.ProductKey\nWHERE o.OrderDate BETWEEN @StartDate AND @EndDate\n  AND r.RegionName IN (@Region)",
+          "isStoredProc": false,
+          "queryParameters": [
+            {
+              "name": "@StartDate",
+              "value": "=Parameters!StartDate.Value"
+            },
+            {
+              "name": "@EndDate",
+              "value": "=Parameters!EndDate.Value"
+            },
+            {
+              "name": "@Region",
+              "value": "=Parameters!Region.Value"
+            }
+          ],
+          "fields": [
+            {
+              "name": "OrderDate",
+              "dataField": "OrderDate",
+              "expression": null,
+              "calculated": false,
+              "typeName": "System.DateTime"
+            },
+            {
+              "name": "RegionName",
+              "dataField": "RegionName",
+              "expression": null,
+              "calculated": false,
+              "typeName": "System.String"
+            },
+            {
+              "name": "Category",
+              "dataField": "Category",
+              "expression": null,
+              "calculated": false,
+              "typeName": "System.String"
+            },
+            {
+              "name": "SalesAmount",
+              "dataField": "SalesAmount",
+              "expression": null,
+              "calculated": false,
+              "typeName": "System.Decimal"
+            },
+            {
+              "name": "OrderQty",
+              "dataField": "OrderQty",
+              "expression": null,
+              "calculated": false,
+              "typeName": "System.Int32"
+            },
+            {
+              "name": "MarginPct",
+              "dataField": null,
+              "expression": "=IIf(Sum(Fields!SalesAmount.Value) = 0, 0, Sum(Fields!SalesAmount.Value) * 0.32 / Sum(Fields!SalesAmount.Value))",
+              "calculated": true,
+              "typeName": null
+            }
+          ]
+        }
+      ],
+      "parameters": [
+        {
+          "name": "StartDate",
+          "dataType": "DateTime",
+          "multiValue": false,
+          "nullable": false,
+          "prompt": "Start Date",
+          "defaultValues": [
+            "=DateAdd(\"d\", -90, Today())"
+          ],
+          "validValuesQuery": null,
+          "validValuesStatic": null
+        },
+        {
+          "name": "EndDate",
+          "dataType": "DateTime",
+          "multiValue": false,
+          "nullable": false,
+          "prompt": "End Date",
+          "defaultValues": [
+            "=Today()"
+          ],
+          "validValuesQuery": null,
+          "validValuesStatic": null
+        },
+        {
+          "name": "Region",
+          "dataType": "String",
+          "multiValue": true,
+          "nullable": false,
+          "prompt": "Region",
+          "defaultValues": [
+            "East",
+            "West",
+            "Central"
+          ],
+          "validValuesQuery": {
+            "dataSet": "RegionList",
+            "valueField": "RegionName",
+            "labelField": "RegionName"
+          },
+          "validValuesStatic": null
+        }
+      ],
+      "bodyItems": [
+        {
+          "kind": "tablix",
+          "name": "SalesMatrix",
+          "shape": "matrix",
+          "dataSetName": "OrderFacts",
+          "rowGroups": [
+            {
+              "name": "RegionGroup",
+              "expressions": [
+                "=Fields!RegionName.Value"
+              ]
+            }
+          ],
+          "columnGroups": [
+            {
+              "name": "CategoryGroup",
+              "expressions": [
+                "=Fields!Category.Value"
+              ]
+            }
+          ],
+          "valueExpressions": [
+            "=Sum(Fields!SalesAmount.Value)"
+          ],
+          "position": {
+            "top": "1.2in",
+            "left": "0.2in",
+            "width": "2.5in",
+            "height": "1in"
+          }
+        },
+        {
+          "kind": "chart",
+          "name": "SalesByRegionChart",
+          "chartType": "Column",
+          "dataSetName": "OrderFacts",
+          "categoryExpressions": [
+            "=Fields!RegionName.Value"
+          ],
+          "series": [
+            {
+              "name": "SalesSeries",
+              "values": [
+                "=Sum(Fields!SalesAmount.Value)"
+              ]
+            }
+          ],
+          "position": {
+            "top": "0.1in",
+            "left": "0.2in",
+            "width": "5in",
+            "height": "1in"
+          }
+        }
+      ],
+      "pageHeaderItems": [
+        {
+          "kind": "textbox",
+          "name": "Title",
+          "value": "Sales by Region"
+        }
+      ],
+      "pageFooterItems": []
+    }
+  ]
+}

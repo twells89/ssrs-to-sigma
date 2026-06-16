@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "ssrs-to-sigma",
+  "displayName": "SSRS → Sigma",
+  "version": "0.1.0",
+  "description": "Migrate Microsoft SSRS (SQL Server Reporting Services) reports to Sigma — RDL/RDLC report definitions → Sigma data model + workbook, with a firewall-friendly customer-side export step, RDL XML parsing, SSRS-expression translation, Tablix matrix→pivot / table→table / chart→chart mapping, parameters→controls, and a parity-verification scaffold. Honors the sibling converters' 'flag, never fake' contract: raw-SQL/stored-proc datasets, custom VB code, and pixel-perfect paginated layouts are surfaced as loud flags rather than silently mis-converted. Built from research; structurally validated against a bundled fixture. Includes a read-only estate assessment. Companion to the sigma-migration-skills converters.",
+  "author": { "name": "Thomas Wells" },
+  "license": "MIT",
+  "keywords": ["ssrs", "sql-server-reporting-services", "rdl", "reporting-services", "sigma", "migration", "bi", "converter", "assessment"],
+  "skills": "./skills/"
+}
