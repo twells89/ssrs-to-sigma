@@ -67,6 +67,28 @@ Per report → one page: a **base table** sourcing the DM element
 table by element id, plus controls. Downstream elements reference base columns
 with the `[<BaseName>/<Col>]` prefix. This mirrors the sibling converters.
 
+The emitted spec is the **current workbooks-as-code shape**:
+`{name, folderId, document}` with `document.kind: workbook`, a single **flat**
+`document.elements` array (elements are workbook-global, not nested in pages),
+metadata-only `document.pages`, and a `document.layout` XML string that places
+every element. `convert.py` validates ids/placement locally before writing.
+The layout is a **stacked, full-width 24-column starter grid** — every element
+placed once, one row band each — not a reproduction of the RDL's pixel geometry
+(the parsed `position` boxes are still ignored; mapping `<Top>/<Left>/<Width>/
+<Height>` onto the grid is a future enhancement). The DM spec is unchanged:
+data-model code-rep keeps `pages[].elements`; only the workbook surface moved to
+the `document` wrapper.
+
+### RDL layout nesting (2008/2010 vs 2016+)
+`parse_rdl._iter_layouts()` resolves both the flat root-level `<Body>`/`<Page>`
+and the RDL 2016 `<ReportSections><ReportSection>` nesting, concatenating items
+across every section. This is a structural axis independent of the namespace
+one, so namespace stripping alone does not cover it. A layout that parses to
+zero visuals while datasets/parameters exist emits a `warnings` entry and is
+scored MANUAL — the previous behavior silently lost every visual and scored the
+report AUTO. Multi-section reports currently flatten into one workbook page;
+mapping sections → separate pages is a possible future refinement.
+
 ## Hard problems / known gaps
 
 - **Stored-proc datasets** — `EXEC sp_x @p=1` doesn't run in Sigma's warehouse

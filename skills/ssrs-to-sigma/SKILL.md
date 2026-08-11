@@ -92,8 +92,18 @@ python3 scripts/parse_rdl.py --dir ssrs-export/reports -o bundle.json
 
 Namespace-agnostic RDL parse → datasources, datasets (SQL / proc + query
 params + fields), report parameters, and a Tablix/chart/gauge/map/subreport
-inventory per report. `bundle.json` is the converter contract;
-`fixtures/expected_bundle.json` is a real parse to diff against.
+inventory per report. Handles **both** the flat 2008/2010 `<Body>`/`<Page>`
+layout **and** the RDL 2016+ `<ReportSections><ReportSection>` nesting (items
+concatenated across sections) — see `refs/rdl-format.md`. A report whose layout
+parses to zero visuals while it still has datasets/parameters is flagged as a
+likely structural miss, never a clean empty success.
+
+`bundle.json` is the converter contract. Regression-check the parser against
+both goldens with the offline suite (stdlib, no pytest):
+
+```bash
+python3 -m unittest discover -s tests    # or: python3 tests/test_ssrs.py
+```
 
 ## Phase 1.5 — Reuse an existing data model (recommended)
 
@@ -112,8 +122,17 @@ python3 scripts/convert.py --bundle bundle.json \
 ```
 
 Emits `sigma_dm_spec.json` (one Custom-SQL element per dataset),
-`sigma_workbook_spec.json` (page per report: base table → pivot/table/chart +
-controls), `parity_keys.json`, and **`conversion_report.md`** — the flag list.
+`sigma_workbook_spec.json`, `parity_keys.json`, and **`conversion_report.md`**
+— the flag list.
+
+`sigma_workbook_spec.json` is the **current workbooks-as-code** shape:
+`{name, folderId, document}` where `document` has `kind: workbook`, a **flat**
+`elements` array (base table → pivot/table/chart + controls, per report), a
+metadata-only `pages` array, and a `layout` XML string that places every
+element exactly once on a 24-column grid. (The data-model spec keeps its
+`pages[].elements` nesting — only the *workbook* surface changed.) The
+converter runs a local structural check (unique ids, every element placed, no
+dangling layout reference) before writing.
 
 **Read `conversion_report.md` before POSTing.** The converter preserves dataset
 SQL **verbatim** — it does not translate T-SQL dialect or rewrite `@parameters`
@@ -152,7 +171,20 @@ curl -s -X POST "$SIGMA_BASE_URL/v2/workbooks/spec" \
   -d @sigma_workbook_spec.json      # -> workbookId
 ```
 
-Read the workbook spec back the same way; confirm no `type: error` columns.
+> **Workbooks as Code is a private-beta surface.** `POST /v2/workbooks/spec`
+> (and its `/verify` sibling) is entitlement-gated — confirm the workspace has
+> it enabled before Phase 4, or the POST 404s/403s regardless of a valid spec.
+> The **data model** endpoints (Phase 3) are GA. The converter already emits the
+> current `{name, folderId, document:{…}}` envelope with flat `elements` +
+> `layout`; the pre-`document` flat body is rejected with HTTP 400. Before
+> POSTing, validate against the live shape with the `sigma-workbooks` skill's
+> `validate-spec.sh` / `POST …/spec/verify` — the field surface (control value
+> fields, layout tag vocabulary) drifts and the OpenAPI is the source of truth.
+
+Read the workbook spec back the same way; confirm no `type: error` columns and
+that your authored `layout` survived (a readback that hoisted every element to
+a stacked `1 / 13` span means the layout was dropped — see `sigma-workbooks`
+`reference/specification/layout.md`).
 (Workbook DELETE for a retry is `DELETE /v2/files/<id>`, not `/v2/workbooks/<id>`.)
 
 ## Phase 5/6 — Verify parity (hard gate — the real proof)
@@ -182,7 +214,7 @@ Sigma reads the live warehouse; re-capture SSRS numbers if rows landed since.
 **Converts:** raw-SQL datasets → Custom-SQL DM elements · Tablix matrix →
 `pivot-table` (rowsBy/columnsBy/values) · Tablix table → `table` · column/bar/
 line/area/pie/doughnut/scatter charts → matching Sigma chart · report
-parameters → date/list/number/checkbox controls · clean VB expressions
+parameters → date-range/list/number/checkbox controls · clean VB expressions
 (`IIf`→`If`, `Switch`, aggregates, scope-arg drop) · page-header titles → text.
 
 **Flagged (loud, with table fallback — never silently wrong):** stored-proc &
@@ -200,6 +232,13 @@ pixel-perfect paginated layouts (assess as redesign).
   `refs/ssrs-rest-api.md`.
 - **RDL namespace drifts by version** (2008/2010/2016) — the parser walks by
   local tag name; never hard-code a namespace.
+- **RDL 2016+ nests the layout in `<ReportSections><ReportSection>`** (and may
+  have several sections) — a *structural nesting* axis, separate from the
+  namespace one. The parser walks in and concatenates items across sections;
+  never assume `<Body>`/`<Page>` sit directly under `<Report>`.
+- **Workbook spec is `document`-wrapped** (workbooks-as-code) — flat
+  `document.elements` + a `document.layout` that places every element; the old
+  `pages[].elements` body 400s. The DM spec is unchanged.
 - **`BETWEEN x AND y` contains literal ` AND `** — why SQL is never auto-split.
 - **Snowflake uppercases unquoted SQL output columns** — Custom SQL refs default
   to `[Custom SQL/UPPERCASE]`; `--no-uppercase` for case-sensitive warehouses.
