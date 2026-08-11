@@ -281,26 +281,86 @@ def parse_report_items(container):
     return items
 
 
+def _iter_layouts(root):
+    """Yield the (Body, Page) pairs that carry the report's visuals.
+
+    RDL 2016+ (2016/01 schema, SSDT / Power BI Report Server) wraps the layout
+    in <ReportSections><ReportSection><Body>/<Page>, and a report may carry
+    MORE THAN ONE <ReportSection>. Older 2008/2010 RDL puts a single <Body>/
+    <Page> directly under <Report>. This is a structural nesting axis — NOT the
+    namespace axis _local() already strips — so walk into the sections when they
+    exist, else fall back to the flat root layout. Missing this walk is how
+    every Tablix/Chart/Subreport in a 2016 export is silently lost.
+    """
+    sections = children(child(root, "ReportSections"), "ReportSection")
+    if sections:
+        for sec in sections:
+            yield child(sec, "Body"), child(sec, "Page")
+    else:
+        yield child(root, "Body"), child(root, "Page")
+
+
 def parse_rdl(path):
     tree = ET.parse(path)
     root = tree.getroot()
     if _local(root.tag) != "Report":
         raise ValueError(f"{path}: root element is <{_local(root.tag)}>, not <Report> — not an RDL file")
 
-    body = child(root, "Body")
-    page = child(root, "Page")
     name = os.path.splitext(os.path.basename(path))[0]
 
-    return {
+    body_items = []
+    page_header_items = []
+    page_footer_items = []
+    layout_found = False
+    # Concatenate items across every ReportSection (multi-section 2016 reports)
+    # and across the flat legacy layout — one flat inventory per report.
+    for body, page in _iter_layouts(root):
+        if body is not None or page is not None:
+            layout_found = True
+        body_items.extend(parse_report_items(body))
+        if page is not None:
+            page_header_items.extend(parse_report_items(child(page, "PageHeader")))
+            page_footer_items.extend(parse_report_items(child(page, "PageFooter")))
+
+    if not layout_found:
+        # No <Body>/<Page> under <Report> OR any <ReportSection> — this is a
+        # malformed/unsupported RDL, not a genuinely empty report. Fail loudly.
+        raise ValueError(
+            f"{path}: no <Body>/<Page> found under <Report> or <ReportSections> — "
+            "malformed RDL or an unsupported layout wrapper"
+        )
+
+    datasets = parse_datasets(root)
+    parameters = parse_parameters(root)
+
+    warnings = []
+    if not (body_items or page_header_items or page_footer_items):
+        # A layout element existed but produced zero recognized visuals. When a
+        # report also has datasets or parameters that is almost always a
+        # structural miss (a layout wrapper the parser doesn't walk), not a
+        # genuinely empty report — surface it instead of passing as clean.
+        if datasets or parameters:
+            warnings.append(
+                "no report items parsed but datasets/parameters were found — "
+                "likely an unrecognized layout wrapper; the visual inventory may be incomplete"
+            )
+            print(f"!! {path}: {warnings[-1]}", file=sys.stderr)
+
+    report = {
         "report": name,
         "sourceFile": os.path.basename(path),
         "dataSources": parse_data_sources(root),
-        "dataSets": parse_datasets(root),
-        "parameters": parse_parameters(root),
-        "bodyItems": parse_report_items(body),
-        "pageHeaderItems": parse_report_items(child(page, "PageHeader")) if page is not None else [],
-        "pageFooterItems": parse_report_items(child(page, "PageFooter")) if page is not None else [],
+        "dataSets": datasets,
+        "parameters": parameters,
+        "bodyItems": body_items,
+        "pageHeaderItems": page_header_items,
+        "pageFooterItems": page_footer_items,
     }
+    # Emit `warnings` only when non-empty so a clean legacy parse stays
+    # byte-identical to expected_bundle.json (the golden regression).
+    if warnings:
+        report["warnings"] = warnings
+    return report
 
 
 def main():

@@ -56,6 +56,17 @@ def classify_report(rep):
         if p.get("multiValue"):
             reasons["hint"].append(f"param {p['name']}: multi-value → list control")
 
+    # A parse that found datasets/parameters but zero visuals is almost always a
+    # structural miss (e.g. an RDL layout wrapper the parser didn't walk), not a
+    # genuinely empty report — never let it score AUTO. parse_rdl surfaces the
+    # same condition as a `warnings` entry; carry those through too.
+    for w in rep.get("warnings", []):
+        reasons["manual"].append(f"parser: {w}")
+    if not rep.get("bodyItems") and (rep.get("dataSets") or rep.get("parameters")):
+        reasons["manual"].append(
+            "no report visuals parsed despite datasets/parameters — check RDL layout / ReportSections"
+        )
+
     for it in rep.get("bodyItems", []):
         k = it.get("kind")
         if k in UNHANDLED_KINDS:
