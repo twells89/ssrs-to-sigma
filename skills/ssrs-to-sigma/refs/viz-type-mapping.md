@@ -39,13 +39,20 @@ expectation, not a promise.
 
 | SSRS parameter | Sigma control | Difficulty |
 |---|---|---|
-| Single value, String | `list` | clean |
-| Single value, DateTime | `date` (Start/End pair → date-range) | clean |
+| Single value, String | `list` (`selectionMode: single`) | clean |
+| Single value, DateTime | `date-range` (SSRS date params are typically BETWEEN pairs) | clean |
 | Single value, Integer/Float | `number` | clean |
 | Boolean | `checkbox` | clean |
-| Multi-value (`MultiValue=true`) | `list` + `multiSelect` | clean (filter wiring manual) |
-| Valid values from a dataset query | `list` sourced from a DM column | medium — flagged |
+| Multi-value (`MultiValue=true`) | `list` (`selectionMode: multiple`) | clean (filter wiring manual) |
+| Valid values from a dataset query | `list` with a value-list `source` on a DM column | medium — flagged |
 | Default = expression (`=Today()`) | set control default by hand | medium — flagged |
+
+> **Control field names are the current workbooks-as-code shape.** A `list`
+> control carries flat `mode` / `selectionMode` / `values` (NOT the removed
+> `multiSelect` / `defaultValue`); its value-list `source` and the `filters`
+> binding to the base-table column it filters are emitted as **flags**, because
+> both depend on how the dataset SQL / `@parameter` was resolved. The converter
+> does not fake a column binding — flag, never fake.
 
 ## Why "flagged" matters
 

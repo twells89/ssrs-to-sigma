@@ -19,10 +19,21 @@ A second designer namespace, usually prefixed `rd:`
 (`http://schemas.microsoft.com/SQLServer/reporting/reportdesigner`), carries
 authoring hints like `<rd:TypeName>`.
 
-**The element *tree* is stable across these years — only the namespace URI
-changes.** So the parser strips namespaces and walks by **local tag name**
-(`_local()` / `child()` / `descendants()`), making it version-agnostic. Don't
+**The namespace URI changes by year, but that is only *one* compatibility
+axis.** The parser strips namespaces and walks by **local tag name**
+(`_local()` / `child()` / `descendants()`), making it namespace-agnostic. Don't
 hard-code a namespace.
+
+**A second, independent axis is *structural nesting*** — where the layout
+elements sit in the tree — and it is NOT solved by namespace stripping. RDL
+2016+ (2016/01 schema, SSDT / Power BI Report Server) wraps the layout in
+`<ReportSections><ReportSection><Body>/<Page>`, and permits **more than one**
+`<ReportSection>`. Older 2008/2010 RDL puts a single `<Body>`/`<Page>` directly
+under `<Report>`. `parse_rdl()` walks into the sections (concatenating items
+across all of them) and falls back to the flat root layout — see
+`_iter_layouts()`. Missing this walk is how a real 2016 export silently loses
+every Tablix/Chart/Subreport while datasets and parameters (direct children of
+`<Report>`) still parse, so the report looks like a clean, empty success.
 
 **RDLC** (the client/local variant used by ReportViewer) is the same XML minus
 the `<DataSources>` block — data is bound at runtime. The parser handles it
@@ -61,14 +72,34 @@ identically; you just won't get connection strings.
       <ValidValues>
         <DataSetReference><DataSetName/><ValueField/><LabelField/>  → dynamic list
         <ParameterValues><ParameterValue><Value/>                   → static list
-  <Body>
-    <ReportItems> … </ReportItems>    the visuals (see below)
-    <Height>…</Height>
+  <Body>                              2008/2010 flat layout: Body/Page are
+    <ReportItems> … </ReportItems>    the visuals (see below)   direct children
+    <Height>…</Height>                                          of <Report>
   <Width>…</Width>                    (page width sits on <Report>)
   <Page>
     <PageHeader><ReportItems>…        → pageHeaderItems
     <PageFooter><ReportItems>…        → pageFooterItems
 ```
+
+**RDL 2016+ nests that same Body/Page inside report sections** (and may have
+more than one section). The parser reads every section, so the resulting
+`bodyItems` / `pageHeaderItems` / `pageFooterItems` are the concatenation
+across all of them:
+
+```
+<Report>
+  <ReportSections>
+    <ReportSection>
+      <Body><ReportItems> … </ReportItems></Body>   → bodyItems (this + every other section)
+      <Page><PageHeader/><PageFooter/></Page>        → pageHeaderItems / pageFooterItems
+    <ReportSection> …                                (multi-section: items concatenated)
+```
+
+If a `<Report>` has neither a flat `<Body>`/`<Page>` nor any `<ReportSection>`,
+`parse_rdl()` raises (malformed / unsupported layout). If a layout element
+exists but yields zero recognized visuals while datasets/parameters are
+present, the report carries a `warnings` entry (also printed to stderr) so the
+miss surfaces instead of scoring as a clean, empty report.
 
 ## Report items (the visuals)
 
@@ -135,22 +166,33 @@ parameters[]    name, dataType, multiValue, nullable, prompt,
                 defaultValues[], validValuesQuery{dataSet,valueField,labelField},
                 validValuesStatic[]
 bodyItems[]     tablix | chart | gauge | map | subreport | textbox
+                (concatenated across every <ReportSection> for 2016+ RDL)
 pageHeaderItems[]
 pageFooterItems[]
+warnings[]      present ONLY when a structural miss is suspected (layout found
+                but zero visuals parsed while datasets/parameters exist)
 ```
 
 `fixtures/expected_bundle.json` is a real parse of `fixtures/SalesByRegion.rdl`
-— diff against it as a regression check after changing the parser.
+(flat 2008/2010 layout) and `fixtures/expected_reportsections_bundle.json` is a
+real parse of `fixtures/ReportSections2016.rdl` (2016 `<ReportSections>` with a
+subreport + grouped Tablix + header/footer). Diff against both after changing
+the parser — the offline suite in `tests/test_ssrs.py` does exactly this.
 
 ## Gotchas
 
 - **Namespace drift** — never match on a full namespaced tag; walk by local
   name. (Already handled — just don't "fix" it by hard-coding 2016.)
+- **ReportSections is a *nesting* axis, not a namespace one** — stripping the
+  namespace does not reach into `<ReportSections><ReportSection>`; the parser
+  walks in explicitly. (Already handled — see `_iter_layouts()`. The "never
+  hard-code a namespace" rule above does NOT cover this.)
 - **RDLC has no `<DataSources>`** — `dataSources` will be empty; that's normal.
 - **Shared datasets / shared data sources** are external references
   (`<DataSourceReference>`, `<DataSet>` with no inline `<Query>`). The RDL only
-  names them — you must export them too, or supply the SQL. The parser flags a
-  dataset with no `<CommandText>`.
+  names them — you must export them too, or supply the SQL. A dataset with no
+  `<CommandText>` is flagged **downstream** (`convert.py` / `scan_gaps.py`), not
+  by the parser — `parse_rdl` just records `commandText: null`.
 - **`BETWEEN x AND y` contains the literal ` AND `** — any code that splits a
   WHERE clause on ` AND ` will corrupt it. This is why `convert.py` does **not**
   auto-rewrite SQL; it preserves `CommandText` verbatim and flags.

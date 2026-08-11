@@ -36,9 +36,27 @@ controls, and a flag list noting the T-SQL/parameter work.
 3. Walk Phases 1 → 6 in `SKILL.md`. The hard gates are Phase 3 (`type: error`
    scan on DM readback) and Phase 5/6 (`verify_parity.py` GREEN).
 
-## Regression check after editing the parser
+## Regression check after editing the parser or converter
+
+The offline suite (stdlib `unittest`, no pytest) is the fast gate — it diffs
+both parser goldens, checks section/header/footer retention, multi-section
+concatenation, the empty-layout diagnostics, and the workbooks-as-code
+workbook shape:
+
+```bash
+python3 -m unittest discover -s tests      # or: python3 tests/test_ssrs.py
+```
+
+Prefer a manual byte-diff of a single fixture? Both goldens diff the same way:
 
 ```bash
 python3 scripts/parse_rdl.py fixtures/SalesByRegion.rdl -o /tmp/b.json
 diff <(python3 -m json.tool /tmp/b.json) <(python3 -m json.tool fixtures/expected_bundle.json)
+
+python3 scripts/parse_rdl.py fixtures/ReportSections2016.rdl -o /tmp/rs.json
+diff <(python3 -m json.tool /tmp/rs.json) <(python3 -m json.tool fixtures/expected_reportsections_bundle.json)
 ```
+
+`fixtures/SalesByRegion.rdl` is the flat 2008/2010 layout;
+`fixtures/ReportSections2016.rdl` and `fixtures/MultiSection2016.rdl` exercise
+the RDL 2016 `<ReportSections>` nesting (single- and multi-section).

@@ -48,17 +48,6 @@ CHART_KIND = {
     "scatter": "scatter-chart",
 }
 
-# SSRS parameter DataType -> Sigma control kind
-CONTROL_KIND = {
-    "datetime": "date",       # single date; range handled below
-    "date": "date",
-    "string": "list",
-    "integer": "number",
-    "float": "number",
-    "boolean": "checkbox",
-}
-
-
 def slug(*parts):
     s = "-".join(str(p) for p in parts if p is not None)
     s = re.sub(r"[^A-Za-z0-9]+", "-", s).strip("-").lower()
@@ -159,37 +148,94 @@ def build_dm(bundle, conn_id, name, folder_id, uppercase, flags):
 # workbook
 # ---------------------------------------------------------------------------
 
-def _control(param, page_id, flags, rname):
-    kind = CONTROL_KIND.get((param["dataType"] or "string").lower(), "list")
-    # DateTime params commonly come in Start/End pairs -> a date control each
+def _control_type(param):
+    """SSRS parameter -> Sigma controlType.
+
+    DateTime params are almost always a Start/End BETWEEN pair, so a single
+    `date-range` control is the honest 1:1 (not two bare `date` controls). Any
+    multi-value non-date param is a multi-select `list`; a single string is a
+    single-select `list`; numerics are `number`; boolean is `checkbox`.
+    """
+    raw = (param["dataType"] or "string").lower()
+    if raw in ("datetime", "date"):
+        return "date-range"
+    if raw == "boolean":
+        return "checkbox"
+    if param["multiValue"]:
+        return "list"
+    if raw in ("integer", "float"):
+        return "number"
+    return "list"
+
+
+def _control(param, flags, rname):
+    """Build a schema-correct control element.
+
+    The widget/value fields are emitted with their CURRENT (workbooks-as-code)
+    names — `mode` / `selectionMode` / `values` on a list, not the removed
+    `multiSelect` / `defaultValue`. The filter wiring (which base-table column
+    this control filters) and a list's value-list `source` depend on how the
+    dataset SQL + `@parameter` were resolved, so they are LOUDLY FLAGGED for a
+    human rather than bound to a guessed column — flag, never fake.
+    """
+    ctype = _control_type(param)
     ctl = {
         "id": slug("ctl", rname, param["name"]),
         "kind": "control",
-        "controlType": kind,
         "controlId": slug(param["name"]),
+        "controlType": ctype,
         "name": param["prompt"] or param["name"],
     }
-    if param["multiValue"]:
-        ctl["multiSelect"] = True
-    if param["defaultValues"]:
-        dv = [d for d in param["defaultValues"] if not str(d).startswith("=")]
-        if dv:
-            ctl["defaultValue"] = dv if param["multiValue"] else dv[0]
-        else:
+
+    if ctype == "list":
+        ctl["mode"] = "include"
+        ctl["selectionMode"] = "multiple" if param["multiValue"] else "single"
+        literals = [d for d in param["defaultValues"] if not str(d).startswith("=")]
+        exprs = [d for d in param["defaultValues"] if str(d).startswith("=")]
+        # `values` is the default SELECTION ([] = all). It is a list for both
+        # single- and multi-select list controls.
+        ctl["values"] = literals
+        if exprs:
             flags.add(rname, f"parameter {param['name']}",
                       "default is an expression (e.g. =Today()) — set the control default by hand")
-    if param["validValuesQuery"]:
-        flags.add(rname, f"parameter {param['name']}",
-                  "valid values come from a dataset query — point the list control's source at "
-                  "the equivalent DM column")
+        if param["validValuesStatic"] or param["validValuesQuery"]:
+            flags.add(rname, f"parameter {param['name']}",
+                      "list control needs a value-list `source` — point it at the DM/base-table column "
+                      "(or dataset-query equivalent) that supplies its choices")
+    elif param["defaultValues"]:
+        # non-list control carrying an expression default (e.g. =Today())
+        if any(str(d).startswith("=") for d in param["defaultValues"]):
+            flags.add(rname, f"parameter {param['name']}",
+                      "default is an expression (e.g. =Today()) — set the control default by hand")
+
+    # Filter wiring is the one thing we never fake: it depends on the resolved
+    # SQL/@parameter, so surface it instead of binding a guessed column.
+    flags.add(rname, f"parameter {param['name']}",
+              f"wire this {ctype} control's `filters` to the base-table column it filters "
+              "(depends on how the dataset SQL / @parameter was resolved)")
     return ctl
 
 
 def build_workbook(bundle, dm_id, dm_element_ids, dm_element_index,
                    name, folder_id, flags):
-    pages = []
+    # Workbooks-as-code: elements are a single FLAT, workbook-global collection;
+    # `pages` carries metadata only; `layout` XML is the sole source of truth for
+    # which page each element sits on. (The data-model spec keeps its
+    # pages[].elements nesting — only the WORKBOOK surface changed.)
+    all_elements = []
+    pages_meta = []
+    page_blocks = []
     for rep in bundle["reports"]:
         rname = rep["report"]
+        # Surface any parser warning (e.g. an unrecognized RDL layout wrapper)
+        # and refuse to let a visual-less report convert silently — an empty
+        # body with live datasets is a structural miss, not a clean report.
+        for w in rep.get("warnings", []):
+            flags.add(rname, "parse", w)
+        if not rep.get("bodyItems") and (rep.get("dataSets") or rep.get("parameters")):
+            flags.add(rname, "report body",
+                      "no report visuals parsed — only a base table will be emitted; "
+                      "check the RDL layout / ReportSections nesting before trusting this workbook")
         idx = dm_element_index.get(rname, {})
         if not idx:
             continue
@@ -235,16 +281,16 @@ def build_workbook(bundle, dm_id, dm_element_ids, dm_element_index,
 
         # controls
         for p in rep["parameters"]:
-            elements.append(_control(p, page_id, flags, rname))
+            elements.append(_control(p, flags, rname))
 
-        # title from page header
+        # title from page header — a `text` element carries Markdown in `body`
+        # (no `name`/`content`, which the current spec rejects/strips).
         for hi in rep.get("pageHeaderItems", []):
             if hi.get("kind") == "textbox" and hi.get("value") and not str(hi["value"]).startswith("="):
                 elements.append({
                     "id": slug("txt", rname, hi["name"]),
                     "kind": "text",
-                    "name": hi["value"],
-                    "content": hi["value"],
+                    "body": hi["value"],
                 })
                 break
 
@@ -264,14 +310,79 @@ def build_workbook(bundle, dm_id, dm_element_ids, dm_element_index,
                     "columns": base_cols[:3] or [{"id": slug("c", rname, "_"), "name": "_", "formula": "1"}],
                 })
 
-        pages.append({"id": page_id, "name": rname, "elements": elements})
+        all_elements.extend(elements)
+        pages_meta.append({"id": page_id, "name": rname})
+        page_blocks.append(_page_layout(page_id, elements))
 
-    return {
-        "name": name,
-        "folderId": folder_id,
+    document = {
         "schemaVersion": 1,
-        "pages": pages,
+        "kind": "workbook",
+        "elements": all_elements,
+        "pages": pages_meta,
     }
+    if page_blocks:
+        document["layout"] = ('<?xml version="1.0" encoding="utf-8"?>\n'
+                              + "\n".join(page_blocks))
+    spec = {"name": name, "folderId": folder_id, "document": document}
+    _validate_workbook(spec)
+    return spec
+
+
+# element kind -> a sensible vertical row span for the stacked starter layout.
+_LAYOUT_SPAN = {
+    "control": 3, "text": 2, "kpi-chart": 5,
+    "table": 12, "pivot-table": 12, "input-table": 12,
+}
+_DEFAULT_SPAN = 10
+
+
+def _page_layout(page_id, elements):
+    """One page's layout XML: a stacked, full-width 24-column grid.
+
+    Every element is placed exactly once (the API rejects an unplaced element),
+    each on its own row band. This is a valid starter layout, not a faithful
+    reproduction of the RDL's pixel geometry — mapping <Top>/<Left>/<Width>/
+    <Height> onto the grid is a later enhancement. `document.elements[].id`
+    values are slugs (`[a-z0-9-]`), so they need no XML-attribute escaping.
+    """
+    lines = [
+        f'<Page type="grid" gridTemplateColumns="repeat(24, 1fr)" '
+        f'gridTemplateRows="auto" id="{page_id}">'
+    ]
+    row = 1
+    for el in elements:
+        span = _LAYOUT_SPAN.get(el.get("kind"), _DEFAULT_SPAN)
+        lines.append(
+            f'  <Element elementId="{el["id"]}" gridColumn="1 / 25" '
+            f'gridRow="{row} / {row + span}"/>'
+        )
+        row += span
+    lines.append("</Page>")
+    return "\n".join(lines)
+
+
+def _validate_workbook(spec):
+    """Structural guard before write: unique ids, every element placed once,
+    no dangling layout reference. Cheap local checks that catch the mistakes a
+    200-POST would otherwise mask (or reject opaquely)."""
+    doc = spec["document"]
+    ids = [e.get("id") for e in doc["elements"]]
+    seen, dupes = set(), set()
+    for i in ids:
+        if i in seen:
+            dupes.add(i)
+        seen.add(i)
+    if dupes:
+        raise ValueError(f"workbook spec: duplicate element ids {sorted(dupes)}")
+    layout = doc.get("layout", "")
+    placed = set(re.findall(r'elementId="([^"]+)"', layout))
+    idset = set(ids)
+    unplaced = idset - placed
+    dangling = placed - idset
+    if unplaced:
+        raise ValueError(f"workbook spec: elements missing from layout {sorted(unplaced)}")
+    if dangling:
+        raise ValueError(f"workbook spec: layout references unknown elements {sorted(dangling)}")
 
 
 def _grp_field(expr):
@@ -320,9 +431,18 @@ def _tablix_element(it, rname, base_id, base_name, flags):
         el["columnsBy"] = cols_by
     else:
         el["kind"] = "table"
-        if rows_by or cols_by:
-            # grouped table: keep dims first, then values, via order
-            el["order"] = [c["id"] for c in cols]
+        el["order"] = [c["id"] for c in cols]
+        dim_ids = [d["id"] for d in rows_by] + [d["id"] for d in cols_by]
+        if dim_ids and values:
+            # A grouped Tablix is an AGGREGATED query. A Sigma `table` without a
+            # `groupings` entry renders raw detail rows (the #1 migration bug —
+            # dimensions repeat, aggregate cells read per-row), so a grouped
+            # table MUST carry groupBy dims + aggregate calculations.
+            el["groupings"] = [{
+                "id": slug("grp", rname, it["name"]),
+                "groupBy": dim_ids,
+                "calculations": values,
+            }]
     return el
 
 
@@ -423,8 +543,10 @@ def main():
     with open("conversion_report.md", "w") as fh:
         fh.write(flags.report_md())
 
+    wb_doc = wb_spec["document"]
     print(f"DM elements: {len(dm_spec['pages'][0]['elements'])}  "
-          f"workbook pages: {len(wb_spec['pages'])}  flags: {len(flags.items)}")
+          f"workbook pages: {len(wb_doc['pages'])}  "
+          f"workbook elements: {len(wb_doc['elements'])}  flags: {len(flags.items)}")
     print(f"wrote {args.out_prefix}_dm_spec.json, {args.out_prefix}_workbook_spec.json, "
           "parity_keys.json, conversion_report.md")
     if flags.items:
