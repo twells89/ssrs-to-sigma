@@ -10,15 +10,16 @@ MicroStrategy). Built standalone so it can graduate into that marketplace's
 
 ## Status: built from research — structurally validated, not yet live-validated
 
-The pipeline runs clean offline and produces well-formed Sigma data-model +
-workbook specs from real RDL:
+The pipeline runs clean offline and produces structurally checked Sigma
+data-model plus workbook and/or fixed-layout report specs from RDL:
 
 - `parse_rdl.py` parses the bundled fixture (`fixtures/SalesByRegion.rdl`) into a
   normalized `bundle.json`.
-- `convert.py` turns that into a Sigma DM spec (Custom-SQL element) and a
-  workbook spec — the matrix Tablix becomes a `pivot-table`, the column chart a
-  `bar-chart`, the report parameters become controls — following the canonical
-  shapes documented in the `sigma-data-models` / `sigma-workbooks` skills.
+- `convert.py` turns that into a Sigma DM spec (Custom-SQL element) and,
+  according to `--target workbook|report|auto`, responsive workbook pages,
+  absolute-pixel report pages, or both for a mixed bundle. The matrix Tablix
+  becomes a `pivot-table`, the column chart a `bar-chart`, and parameters with
+  safely resolved sources become controls.
 
 What it has **not** done yet: a live POST to a Sigma org, or a data-parity run
 against rendered SSRS output. Phases 3–6 are scaffolded and documented as live
@@ -39,7 +40,7 @@ a no-server SSDT `.rptproj` path.
 
 | Skill | What it does |
 |---|---|
-| [`skills/ssrs-to-sigma`](skills/ssrs-to-sigma/SKILL.md) | The converter: customer export → `parse_rdl.py` (RDL XML → `bundle.json`) → `convert.py` (→ Sigma DM + workbook specs) → POST + readback gate → `verify_parity.py` (hard parity gate). Plus `scan_gaps.py` (coverage shortlist) and `ssrs_expr.py` (SSRS VB → Sigma formula translation). |
+| [`skills/ssrs-to-sigma`](skills/ssrs-to-sigma/SKILL.md) | The converter: customer export → `parse_rdl.py` (RDL XML + normalized physical layout → `bundle.json`) → `convert.py` (→ Sigma DM + workbook/report specs) → `publish.py` verify or explicit create/readback/PDF → parity gate. Plus `scan_gaps.py`, `ssrs_expr.py`, and workbook numeric comparison. |
 | [`skills/ssrs-assessment`](skills/ssrs-assessment/SKILL.md) | Read-only estate inventory + readout: report counts, visualization histogram, dataset/parameter mix, and per-report AUTO / HINT / MANUAL / UNHANDLED tags scored against the converter's *actual* coverage (it imports the converter's own classifier, so it can't drift). |
 
 The hard-won knowledge lives in `skills/ssrs-to-sigma/refs/`: `rdl-format.md`
@@ -56,7 +57,8 @@ cd skills/ssrs-to-sigma
 python3 scripts/parse_rdl.py fixtures/SalesByRegion.rdl -o /tmp/bundle.json
 python3 scripts/scan_gaps.py --bundle /tmp/bundle.json -o /tmp/gap.md
 python3 scripts/convert.py --bundle /tmp/bundle.json \
-  --connection-id CONN --folder-id FOLDER --out-prefix /tmp/sigma
+  --connection-id CONN --folder-id FOLDER \
+  --target auto --out-prefix /tmp/sigma
 # -> /tmp/sigma_dm_spec.json, /tmp/sigma_workbook_spec.json, /tmp/conversion_report.md
 
 # Assess an estate (read-only) from exported RDL:
@@ -66,16 +68,44 @@ python3 skills/ssrs-assessment/scripts/assess.py --dir ssrs-export/reports --out
 Or install as a Claude Code plugin and just ask: *"migrate my SSRS reports to
 Sigma"* / *"assess my SSRS estate."*
 
+Load the companion `sigma-authoring` skills (`sigma-data-models` and
+`sigma-workbooks`), plus `sigma-reports` for report output. Both code-rep
+resource families are private beta; reports also require **Create, edit, and
+publish reports** permission. `publish.py` defaults to non-persistent server
+verification and requires `--create` for a persistent POST.
+Report output defaults to `schemaVersion: 1` for offline compatibility only;
+live work must fetch a recent report spec with `?format=json` and pass its
+current version through `convert.py --report-schema-version`.
+Each converted SSRS dataset gets its own base/source dependency. Tablix and
+chart items bind only to their declared `dataSetName`; query-backed parameter
+lists may bind to their declared lookup dataset and exact value field. Static
+valid-value lists are currently omitted with a flag rather than exposed as
+unrestricted data-driven choices.
+
 ## Design contract
 
 Core principle (shared with every sibling converter): **flag, never fake.**
 Anything without a clean Sigma analog — stored-proc datasets, custom VB `Code`,
-gauges/maps/subreports, T-SQL dialect, pixel-perfect paginated layouts — is
-surfaced as a loud flag (`conversion_report.md`) with a readable fallback,
-never silently mis-converted. Dataset SQL is preserved **verbatim**: the
+gauges/maps/subreports and T-SQL dialect — is surfaced as a loud flag
+(`conversion_report.md`) with an honest warning or omission, never silently
+mis-converted. Paginated RDL can target Sigma reports, preserving known
+physical boxes and panels; unsupported or dynamic content remains flagged.
+Dataset SQL is preserved **verbatim**: the
 converter does not gamble on a cross-dialect SQL rewrite. Parity is a hard gate:
 a migration is green only when `verify_parity.py` passes against numbers taken
 from SSRS itself.
+
+Conversion output replacement is transactional: all specs are built and
+validated, staged beside their destinations, atomically replaced, and only
+then are obsolete target artifacts removed. A failed conversion preserves the
+last valid output set. Report validation also rejects documents above Sigma's
+1,000-page limit before any output is replaced.
+
+The required migration gates are: reuse an existing governed DM where
+possible; POST/read back a new DM and stop on errors; finish and preserve
+layout last; verify numeric and visual parity; then detect and test source
+RLS/CLS (including `User!UserID` patterns). No verify or create in this
+repository is claimed as live proof.
 
 ## Graduating into sigma-migration-skills
 

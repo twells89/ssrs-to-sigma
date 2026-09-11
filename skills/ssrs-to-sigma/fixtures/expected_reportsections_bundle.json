@@ -1,114 +1,279 @@
 {
-    "version": 1,
-    "reports": [
+  "version": 1,
+  "reports": [
+    {
+      "report": "ReportSections2016",
+      "sourceFile": "ReportSections2016.rdl",
+      "dataSources": [
         {
-            "report": "ReportSections2016",
-            "sourceFile": "ReportSections2016.rdl",
-            "dataSources": [
-                {
-                    "name": "AuditDW",
-                    "reference": "/Data Sources/AuditDW",
-                    "provider": "SQL",
-                    "connectString": "Data Source=sql02;Initial Catalog=AuditDW"
-                }
-            ],
-            "dataSets": [
-                {
-                    "name": "AuditFacts",
-                    "dataSourceName": "AuditDW",
-                    "commandText": "SELECT s.SiteName, a.AuditDate, a.SampleCount\nFROM dbo.AuditFact a\nJOIN dbo.DimSite s ON a.SiteKey = s.SiteKey\nWHERE a.AuditDate >= @StartDate",
-                    "isStoredProc": false,
-                    "queryParameters": [
-                        {
-                            "name": "@StartDate",
-                            "value": "=Parameters!StartDate.Value"
-                        }
-                    ],
-                    "fields": [
-                        {
-                            "name": "SiteName",
-                            "dataField": "SiteName",
-                            "expression": null,
-                            "calculated": false,
-                            "typeName": "System.String"
-                        },
-                        {
-                            "name": "AuditDate",
-                            "dataField": "AuditDate",
-                            "expression": null,
-                            "calculated": false,
-                            "typeName": "System.DateTime"
-                        },
-                        {
-                            "name": "SampleCount",
-                            "dataField": "SampleCount",
-                            "expression": null,
-                            "calculated": false,
-                            "typeName": "System.Int32"
-                        }
-                    ]
-                }
-            ],
-            "parameters": [
-                {
-                    "name": "StartDate",
-                    "dataType": "DateTime",
-                    "multiValue": false,
-                    "nullable": false,
-                    "prompt": "Start Date",
-                    "defaultValues": [
-                        "=DateAdd(\"d\", -30, Today())"
-                    ],
-                    "validValuesQuery": null,
-                    "validValuesStatic": null
-                }
-            ],
-            "bodyItems": [
-                {
-                    "kind": "subreport",
-                    "name": "DetailSubreport",
-                    "reportName": "SamplingDetail",
-                    "flag": "subreport -> separate page / drillthrough, multi-pass"
-                },
-                {
-                    "kind": "tablix",
-                    "name": "SiteSummary",
-                    "shape": "table",
-                    "dataSetName": "AuditFacts",
-                    "rowGroups": [
-                        {
-                            "name": "SiteGroup",
-                            "expressions": [
-                                "=Fields!SiteName.Value"
-                            ]
-                        }
-                    ],
-                    "columnGroups": [],
-                    "valueExpressions": [
-                        "=Sum(Fields!SampleCount.Value)"
-                    ],
-                    "position": {
-                        "top": "0.6in",
-                        "left": "0.2in",
-                        "width": "3in",
-                        "height": "1in"
-                    }
-                }
-            ],
-            "pageHeaderItems": [
-                {
-                    "kind": "textbox",
-                    "name": "Title",
-                    "value": "Sampling Report Pharmacy Audit"
-                }
-            ],
-            "pageFooterItems": [
-                {
-                    "kind": "textbox",
-                    "name": "Footer",
-                    "value": "Confidential"
-                }
-            ]
+          "name": "AuditDW",
+          "reference": "/Data Sources/AuditDW",
+          "provider": "SQL",
+          "connectString": "Data Source=sql02;Initial Catalog=AuditDW"
         }
-    ]
+      ],
+      "dataSets": [
+        {
+          "name": "AuditFacts",
+          "dataSourceName": "AuditDW",
+          "commandText": "SELECT s.SiteName, a.AuditDate, a.SampleCount\nFROM dbo.AuditFact a\nJOIN dbo.DimSite s ON a.SiteKey = s.SiteKey\nWHERE a.AuditDate >= @StartDate",
+          "isStoredProc": false,
+          "queryParameters": [
+            {
+              "name": "@StartDate",
+              "value": "=Parameters!StartDate.Value"
+            }
+          ],
+          "fields": [
+            {
+              "name": "SiteName",
+              "dataField": "SiteName",
+              "expression": null,
+              "calculated": false,
+              "typeName": "System.String"
+            },
+            {
+              "name": "AuditDate",
+              "dataField": "AuditDate",
+              "expression": null,
+              "calculated": false,
+              "typeName": "System.DateTime"
+            },
+            {
+              "name": "SampleCount",
+              "dataField": "SampleCount",
+              "expression": null,
+              "calculated": false,
+              "typeName": "System.Int32"
+            }
+          ]
+        }
+      ],
+      "parameters": [
+        {
+          "name": "StartDate",
+          "dataType": "DateTime",
+          "multiValue": false,
+          "nullable": false,
+          "prompt": "Start Date",
+          "defaultValues": [
+            "=DateAdd(\"d\", -30, Today())"
+          ],
+          "validValuesQuery": null,
+          "validValuesStatic": null
+        }
+      ],
+      "bodyItems": [
+        {
+          "kind": "subreport",
+          "name": "DetailSubreport",
+          "sectionIndex": 0,
+          "position": {
+            "top": null,
+            "left": null,
+            "width": null,
+            "height": null
+          },
+          "reportName": "SamplingDetail",
+          "flag": "subreport -> separate page / drillthrough, multi-pass"
+        },
+        {
+          "kind": "tablix",
+          "name": "SiteSummary",
+          "shape": "table",
+          "dataSetName": "AuditFacts",
+          "rowGroups": [
+            {
+              "name": "SiteGroup",
+              "expressions": [
+                "=Fields!SiteName.Value"
+              ]
+            }
+          ],
+          "columnGroups": [],
+          "valueExpressions": [
+            "=Sum(Fields!SampleCount.Value)"
+          ],
+          "position": {
+            "top": "0.6in",
+            "left": "0.2in",
+            "width": "3in",
+            "height": "1in"
+          },
+          "sectionIndex": 0
+        }
+      ],
+      "pageHeaderItems": [
+        {
+          "kind": "textbox",
+          "name": "Title",
+          "value": "Sampling Report Pharmacy Audit",
+          "sectionIndex": 0,
+          "position": {
+            "top": null,
+            "left": null,
+            "width": null,
+            "height": null
+          }
+        }
+      ],
+      "pageFooterItems": [
+        {
+          "kind": "textbox",
+          "name": "Footer",
+          "value": "Confidential",
+          "sectionIndex": 0,
+          "position": {
+            "top": null,
+            "left": null,
+            "width": null,
+            "height": null
+          }
+        }
+      ],
+      "layout": {
+        "reportWidth": "6in",
+        "bodyHeight": "2.5in",
+        "pageWidth": null,
+        "pageHeight": null,
+        "margins": {
+          "top": null,
+          "right": null,
+          "bottom": null,
+          "left": null
+        },
+        "headerHeight": "0.5in",
+        "footerHeight": "0.3in",
+        "sectionCount": 1,
+        "pageBreaks": [],
+        "listCount": 0,
+        "subreportCount": 1,
+        "itemPositions": [
+          {
+            "sectionIndex": 0,
+            "region": "body",
+            "kind": "subreport",
+            "name": "DetailSubreport",
+            "position": {
+              "top": null,
+              "left": null,
+              "width": null,
+              "height": null
+            }
+          },
+          {
+            "sectionIndex": 0,
+            "region": "body",
+            "kind": "tablix",
+            "name": "SiteSummary",
+            "position": {
+              "top": "0.6in",
+              "left": "0.2in",
+              "width": "3in",
+              "height": "1in"
+            }
+          },
+          {
+            "sectionIndex": 0,
+            "region": "header",
+            "kind": "textbox",
+            "name": "Title",
+            "position": {
+              "top": null,
+              "left": null,
+              "width": null,
+              "height": null
+            }
+          },
+          {
+            "sectionIndex": 0,
+            "region": "footer",
+            "kind": "textbox",
+            "name": "Footer",
+            "position": {
+              "top": null,
+              "left": null,
+              "width": null,
+              "height": null
+            }
+          }
+        ],
+        "sections": [
+          {
+            "index": 0,
+            "reportWidth": "6in",
+            "bodyHeight": "2.5in",
+            "pageWidth": null,
+            "pageHeight": null,
+            "margins": {
+              "top": null,
+              "right": null,
+              "bottom": null,
+              "left": null
+            },
+            "headerHeight": "0.5in",
+            "footerHeight": "0.3in",
+            "pageBreaks": [],
+            "listCount": 0,
+            "subreportCount": 1,
+            "itemPositions": [
+              {
+                "sectionIndex": 0,
+                "region": "body",
+                "kind": "subreport",
+                "name": "DetailSubreport",
+                "position": {
+                  "top": null,
+                  "left": null,
+                  "width": null,
+                  "height": null
+                }
+              },
+              {
+                "sectionIndex": 0,
+                "region": "body",
+                "kind": "tablix",
+                "name": "SiteSummary",
+                "position": {
+                  "top": "0.6in",
+                  "left": "0.2in",
+                  "width": "3in",
+                  "height": "1in"
+                }
+              },
+              {
+                "sectionIndex": 0,
+                "region": "header",
+                "kind": "textbox",
+                "name": "Title",
+                "position": {
+                  "top": null,
+                  "left": null,
+                  "width": null,
+                  "height": null
+                }
+              },
+              {
+                "sectionIndex": 0,
+                "region": "footer",
+                "kind": "textbox",
+                "name": "Footer",
+                "position": {
+                  "top": null,
+                  "left": null,
+                  "width": null,
+                  "height": null
+                }
+              }
+            ]
+          }
+        ],
+        "signals": {
+          "pageBreakCount": 0,
+          "listCount": 0,
+          "subreportCount": 1
+        }
+      }
+    }
+  ]
 }

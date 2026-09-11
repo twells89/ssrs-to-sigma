@@ -15,9 +15,9 @@ Modeling choices (documented in refs/design-notes.md):
     auto-translated across warehouse dialects, and T-SQL `@parameters` are NOT
     rewritten. Both are surfaced as loud flags. This is deliberate: a silent,
     wrong SQL rewrite is worse than an honest "translate this before POST".
-  * Each report becomes one workbook page: a base table sourcing the DM
-    element, then a pivot-table per matrix Tablix, a table per table Tablix,
-    and a chart per Chart. Report parameters become page controls.
+  * Each report becomes one workbook page: one base table per converted SSRS
+    dataset, then each Tablix/Chart sources the base named by its dataSetName.
+    Safely resolvable report parameters become page controls.
   * Aggregate expressions in Tablix value cells / chart series are translated
     by ssrs_expr.translate() and surfaced as flags when not a clean 1:1.
 
@@ -30,10 +30,18 @@ stdlib only.
 """
 import argparse
 import json
+import math
+import os
 import re
+import shutil
 import sys
+import tempfile
+import xml.etree.ElementTree as ET
 
 import ssrs_expr
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib"))
+import code_rep  # noqa: E402
 
 
 # SSRS chart Type -> Sigma chart element kind
@@ -46,6 +54,9 @@ CHART_KIND = {
     "pie": "pie-chart",
     "doughnut": "donut-chart",
     "scatter": "scatter-chart",
+}
+REPORT_SAFE_CHART_KINDS = {
+    "bar-chart", "line-chart", "area-chart", "scatter-chart",
 }
 
 def slug(*parts):
@@ -168,15 +179,18 @@ def _control_type(param):
     return "list"
 
 
-def _control(param, flags, rname):
+def _control(param, flags, rname, source_contexts=None):
     """Build a schema-correct control element.
 
     The widget/value fields are emitted with their CURRENT (workbooks-as-code)
     names — `mode` / `selectionMode` / `values` on a list, not the removed
-    `multiSelect` / `defaultValue`. The filter wiring (which base-table column
-    this control filters) and a list's value-list `source` depend on how the
-    dataset SQL + `@parameter` were resolved, so they are LOUDLY FLAGGED for a
-    human rather than bound to a guessed column — flag, never fake.
+    `multiSelect` / `defaultValue`. A query-backed list source is wired only
+    when its declared dataset has a converted source context and its value
+    field exactly matches a base column. Static valid values are omitted until
+    a current literal-source shape is proven. Otherwise the control is flagged
+    and omitted. Target filter
+    wiring still depends on the resolved dataset SQL / `@parameter` and remains
+    a loud manual flag — flag, never fake.
     """
     ctype = _control_type(param)
     ctl = {
@@ -198,10 +212,59 @@ def _control(param, flags, rname):
         if exprs:
             flags.add(rname, f"parameter {param['name']}",
                       "default is an expression (e.g. =Today()) — set the control default by hand")
-        if param["validValuesStatic"] or param["validValuesQuery"]:
+        valid_query = param.get("validValuesQuery")
+        valid_static = param.get("validValuesStatic")
+        if valid_query:
+            declared_dataset = valid_query.get("dataSet")
+            source_context = (
+                (source_contexts or {}).get(declared_dataset)
+                if declared_dataset else None
+            )
+            if source_context is None:
+                flags.add(
+                    rname,
+                    f"parameter {param['name']}",
+                    "list valid-values dataset "
+                    f"{declared_dataset!r} has no converted source context; "
+                    "control was omitted rather than binding an unrelated table",
+                )
+                return None
+            source_field = valid_query.get("valueField")
+        elif valid_static is not None:
+            flags.add(
+                rname,
+                f"parameter {param['name']}",
+                "static valid values require a proven current literal value-list "
+                "source shape; control was omitted rather than exposing "
+                "unrestricted data-driven choices",
+            )
+            return None
+        else:
+            flags.add(
+                rname,
+                f"parameter {param['name']}",
+                "list parameter has no declared valid-values source; control was "
+                "omitted rather than guessing a value-list column",
+            )
+            return None
+        source_column = next((
+            column for column in source_context.get("columns") or []
+            if column.get("name") == source_field
+        ), None)
+        if source_column:
+            ctl["source"] = {
+                "kind": "source",
+                "source": {
+                    "kind": "table",
+                    "elementId": source_context["id"],
+                },
+                "columnId": source_column["id"],
+            }
+        else:
             flags.add(rname, f"parameter {param['name']}",
-                      "list control needs a value-list `source` — point it at the DM/base-table column "
-                      "(or dataset-query equivalent) that supplies its choices")
+                      "list control has no safely resolved value-list source and "
+                      "was omitted; map it to a DM/base-table column or a manual source")
+            return None
     elif param["defaultValues"]:
         # non-list control carrying an expression default (e.g. =Today())
         if any(str(d).startswith("=") for d in param["defaultValues"]):
@@ -216,6 +279,132 @@ def _control(param, flags, rname):
     return ctl
 
 
+def _source_contexts(rep, dm_id, dm_element_ids, dm_element_index):
+    """Build one base-table dependency per converted SSRS dataset."""
+    rname = rep["report"]
+    idx = dm_element_index.get(rname, {})
+    if not idx:
+        return {}
+
+    contexts = {}
+    single_dataset = len(idx) == 1
+    for dataset_name, dm_meta in idx.items():
+        if dm_element_ids and dm_meta["name"] in dm_element_ids:
+            dm_el_server_id = dm_element_ids[dm_meta["name"]]
+        else:
+            dm_el_server_id = "{{%s_ID}}" % slug(
+                dm_meta["elementId"]
+            ).upper().replace("-", "_")
+        base_id = (
+            slug("base", rname)
+            if single_dataset else slug("base", rname, dataset_name)
+        )
+        base_name = (
+            f"{rname} Base"
+            if single_dataset else f"{rname} · {dataset_name} Base"
+        )
+        base_cols = [
+            {
+                "id": slug("c", rname, dataset_name, fname),
+                "name": fname,
+                "formula": f"[{dm_meta['name']}/{fname}]",
+            }
+            for fname in dm_meta["fields"]
+        ]
+        contexts[dataset_name] = {
+            "element": {
+                "id": base_id,
+                "kind": "table",
+                "name": base_name,
+                "source": {
+                    "kind": "data-model",
+                    "dataModelId": dm_id or "{{DATA_MODEL_ID}}",
+                    "elementId": dm_el_server_id,
+                },
+                "columns": base_cols,
+            },
+            "id": base_id,
+            "name": base_name,
+            "columns": base_cols,
+            "dataSetName": dataset_name,
+        }
+    return contexts
+
+
+def _source_for_item(item, source_contexts, flags, rname):
+    dataset_name = item.get("dataSetName")
+    if dataset_name:
+        source = source_contexts.get(dataset_name)
+        if source is None:
+            flags.add(
+                rname,
+                f"{item.get('kind')} {item.get('name')}",
+                f"dataset {dataset_name!r} has no converted source context; "
+                "item was omitted",
+            )
+        return source
+    if len(source_contexts) == 1:
+        return next(iter(source_contexts.values()))
+    if not source_contexts:
+        flags.add(
+            rname,
+            f"{item.get('kind')} {item.get('name')}",
+            "item has no dataSetName and no converted dataset source is "
+            "available; item was omitted",
+        )
+        return None
+    flags.add(
+        rname,
+        f"{item.get('kind')} {item.get('name')}",
+        "item has no dataSetName and the report has multiple converted "
+        "datasets; item was omitted rather than guessing a source",
+    )
+    return None
+
+
+def _flag_layout_degradations(report, target, flags):
+    layout = report.get("layout") or {}
+    signals = layout.get("signals") or {}
+    break_inventory = layout.get("pageBreaks")
+    if break_inventory is None:
+        break_inventory = [
+            page_break
+            for section in layout.get("sections") or []
+            for page_break in section.get("pageBreaks") or []
+        ]
+    if break_inventory:
+        page_breaks = sum(
+            str(item.get("disabled") or "").strip().casefold() != "true"
+            for item in break_inventory
+        )
+        dynamic_breaks = sum(
+            str(item.get("disabled") or "").strip().startswith("=")
+            for item in break_inventory
+        )
+    else:
+        page_breaks = int(signals.get("pageBreakCount") or 0)
+        dynamic_breaks = 0
+    lists = int(signals.get("listCount") or 0)
+    if page_breaks:
+        flags.add(
+            report["report"], "page breaks",
+            f"{page_breaks} explicit RDL page break(s) were captured but are not "
+            f"automatically expanded into Sigma {target} pages; split and inspect manually",
+        )
+    if dynamic_breaks:
+        flags.add(
+            report["report"], "dynamic page breaks",
+            f"{dynamic_breaks} RDL page break Disabled expression(s) require "
+            "manual evaluation before target/layout approval",
+        )
+    if lists:
+        flags.add(
+            report["report"], "List data regions",
+            f"{lists} RDL List region(s) were flattened to their recognized child "
+            "items; repeating/banded semantics require manual parity review",
+        )
+
+
 def build_workbook(bundle, dm_id, dm_element_ids, dm_element_index,
                    name, folder_id, flags):
     # Workbooks-as-code: elements are a single FLAT, workbook-global collection;
@@ -227,6 +416,7 @@ def build_workbook(bundle, dm_id, dm_element_ids, dm_element_index,
     page_blocks = []
     for rep in bundle["reports"]:
         rname = rep["report"]
+        _flag_layout_degradations(rep, "workbook", flags)
         # Surface any parser warning (e.g. an unrecognized RDL layout wrapper)
         # and refuse to let a visual-less report convert silently — an empty
         # body with live datasets is a structural miss, not a clean report.
@@ -234,54 +424,23 @@ def build_workbook(bundle, dm_id, dm_element_ids, dm_element_index,
             flags.add(rname, "parse", w)
         if not rep.get("bodyItems") and (rep.get("dataSets") or rep.get("parameters")):
             flags.add(rname, "report body",
-                      "no report visuals parsed — only a base table will be emitted; "
+                      "no report visuals parsed — only dataset dependencies and "
+                      "safe controls will be emitted; "
                       "check the RDL layout / ReportSections nesting before trusting this workbook")
-        idx = dm_element_index.get(rname, {})
-        if not idx:
-            continue
-        # primary dataset = the one most report items reference
-        primary_ds = None
-        for it in rep["bodyItems"]:
-            if it.get("dataSetName"):
-                primary_ds = it["dataSetName"]
-                break
-        primary_ds = primary_ds or next(iter(idx))
-        dm_meta = idx.get(primary_ds) or next(iter(idx.values()))
-
-        # resolve the DM element's server id (placeholder until phase 4)
-        if dm_element_ids and dm_meta["name"] in dm_element_ids:
-            dm_el_server_id = dm_element_ids[dm_meta["name"]]
-        else:
-            dm_el_server_id = "{{%s_ID}}" % slug(dm_meta["elementId"]).upper().replace("-", "_")
+        source_contexts = _source_contexts(
+            rep, dm_id, dm_element_ids, dm_element_index
+        )
 
         page_id = slug("page", rname)
-        base_id = slug("base", rname)
-        base_name = f"{rname} Base"
-
-        # base table: passthrough of the DM element's columns
-        base_cols = []
-        for fname in dm_meta["fields"]:
-            base_cols.append({
-                "id": slug("c", rname, fname),
-                "name": fname,
-                "formula": f"[{fname}]",       # data-model source: reference DM column by name
-            })
-        base_table = {
-            "id": base_id,
-            "kind": "table",
-            "name": base_name,
-            "source": {
-                "kind": "data-model",
-                "dataModelId": dm_id or "{{DATA_MODEL_ID}}",
-                "elementId": dm_el_server_id,
-            },
-            "columns": base_cols,
-        }
-        elements = [base_table]
+        elements = [
+            source["element"] for source in source_contexts.values()
+        ]
 
         # controls
         for p in rep["parameters"]:
-            elements.append(_control(p, flags, rname))
+            control = _control(p, flags, rname, source_contexts)
+            if control:
+                elements.append(control)
 
         # title from page header — a `text` element carries Markdown in `body`
         # (no `name`/`content`, which the current spec rejects/strips).
@@ -298,16 +457,27 @@ def build_workbook(bundle, dm_id, dm_element_ids, dm_element_index,
         for it in rep["bodyItems"]:
             kind = it.get("kind")
             if kind == "tablix":
-                elements.append(_tablix_element(it, rname, base_id, base_name, flags))
+                source = _source_for_item(
+                    it, source_contexts, flags, rname
+                )
+                if source:
+                    elements.append(_tablix_element(
+                        it, rname, source["id"], source["name"], flags
+                    ))
             elif kind == "chart":
-                elements.append(_chart_element(it, rname, base_id, base_name, flags))
+                source = _source_for_item(
+                    it, source_contexts, flags, rname
+                )
+                if source:
+                    elements.append(_chart_element(
+                        it, rname, source["id"], source["name"], flags
+                    ))
             elif kind in ("gauge", "map", "subreport"):
                 flags.add(rname, f"{kind} {it.get('name')}", it.get("flag", f"{kind} not auto-converted"))
                 elements.append({
                     "id": slug(kind, rname, it.get("name")),
-                    "kind": "table", "name": f"[FLAGGED {kind}] {it.get('name')}",
-                    "source": {"kind": "table", "elementId": base_id},
-                    "columns": base_cols[:3] or [{"id": slug("c", rname, "_"), "name": "_", "formula": "1"}],
+                    "kind": "text",
+                    "body": f"**Not converted:** SSRS {kind} `{it.get('name')}`",
                 })
 
         all_elements.extend(elements)
@@ -323,7 +493,7 @@ def build_workbook(bundle, dm_id, dm_element_ids, dm_element_index,
     if page_blocks:
         document["layout"] = ('<?xml version="1.0" encoding="utf-8"?>\n'
                               + "\n".join(page_blocks))
-    spec = {"name": name, "folderId": folder_id, "document": document}
+    spec = code_rep.wrap(document, {"name": name, "folderId": folder_id})
     _validate_workbook(spec)
     return spec
 
@@ -366,6 +536,15 @@ def _validate_workbook(spec):
     no dangling layout reference. Cheap local checks that catch the mistakes a
     200-POST would otherwise mask (or reject opaquely)."""
     doc = spec["document"]
+    page_ids = [page.get("id") for page in doc.get("pages") or []]
+    duplicate_pages = sorted({
+        page_id for page_id in page_ids
+        if page_id and page_ids.count(page_id) > 1
+    })
+    if duplicate_pages:
+        raise ValueError(
+            f"workbook spec: duplicate page ids {duplicate_pages}"
+        )
     ids = [e.get("id") for e in doc["elements"]]
     seen, dupes = set(), set()
     for i in ids:
@@ -375,7 +554,17 @@ def _validate_workbook(spec):
     if dupes:
         raise ValueError(f"workbook spec: duplicate element ids {sorted(dupes)}")
     layout = doc.get("layout", "")
-    placed = set(re.findall(r'elementId="([^"]+)"', layout))
+    placed_all = re.findall(r'elementId="([^"]+)"', layout)
+    duplicate_placements = sorted({
+        element_id for element_id in placed_all
+        if placed_all.count(element_id) > 1
+    })
+    if duplicate_placements:
+        raise ValueError(
+            "workbook spec: elements placed more than once "
+            f"{duplicate_placements}"
+        )
+    placed = set(placed_all)
     idset = set(ids)
     unplaced = idset - placed
     dangling = placed - idset
@@ -406,7 +595,7 @@ def _tablix_element(it, rname, base_id, base_name, flags):
             return None
         cid = slug("d", rname, it["name"], field)
         cols.append({"id": cid, "name": field, "formula": f"[{base_name}/{field}]"})
-        shelf.append({"id": cid})
+        shelf.append({"columnId": cid})
         return cid
 
     for g in it.get("rowGroups", []):
@@ -432,7 +621,10 @@ def _tablix_element(it, rname, base_id, base_name, flags):
     else:
         el["kind"] = "table"
         el["order"] = [c["id"] for c in cols]
-        dim_ids = [d["id"] for d in rows_by] + [d["id"] for d in cols_by]
+        dim_ids = (
+            [d["columnId"] for d in rows_by]
+            + [d["columnId"] for d in cols_by]
+        )
         if dim_ids and values:
             # A grouped Tablix is an AGGREGATED query. A Sigma `table` without a
             # `groupings` entry renders raw detail rows (the #1 migration bug —
@@ -485,6 +677,657 @@ def _chart_element(it, rname, base_id, base_name, flags):
 
 
 # ---------------------------------------------------------------------------
+# target selection and fixed-layout reports
+# ---------------------------------------------------------------------------
+
+_UNIT_TO_PX = {
+    "px": 1.0,
+    "in": 96.0,
+    "cm": 96.0 / 2.54,
+    "mm": 96.0 / 25.4,
+    "pt": 96.0 / 72.0,
+    "pc": 16.0,
+}
+
+
+def _size_px(value, default=0.0):
+    """Convert an RDL physical size to CSS pixels (96 px/in)."""
+    if value in (None, ""):
+        return float(default)
+    match = re.fullmatch(
+        r"\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*([A-Za-z]*)\s*",
+        str(value),
+    )
+    if not match:
+        raise ValueError(f"unsupported RDL size {value!r}")
+    unit = (match.group(2) or "px").lower()
+    if unit not in _UNIT_TO_PX:
+        raise ValueError(f"unsupported RDL size unit {unit!r} in {value!r}")
+    return float(match.group(1)) * _UNIT_TO_PX[unit]
+
+
+def _xml_number(value):
+    value = round(float(value), 3)
+    return str(int(value)) if value.is_integer() else str(value)
+
+
+def resolve_target(report):
+    """Resolve one parsed report from objective print/dashboard signals."""
+    layout = report.get("layout") or {}
+    sections = layout.get("sections") or []
+    signals = layout.get("signals") or {}
+    print_score = 0
+    dashboard_score = 0
+    print_reasons = []
+    dashboard_reasons = []
+
+    break_inventory = layout.get("pageBreaks")
+    if break_inventory is None:
+        break_inventory = [
+            page_break
+            for section in sections
+            for page_break in section.get("pageBreaks") or []
+        ]
+    if break_inventory:
+        page_breaks = sum(
+            str(item.get("disabled") or "").strip().casefold() != "true"
+            for item in break_inventory
+        )
+        dynamic_breaks = sum(
+            str(item.get("disabled") or "").strip().startswith("=")
+            for item in break_inventory
+        )
+    else:
+        page_breaks = int(signals.get("pageBreakCount") or 0)
+        dynamic_breaks = 0
+    lists = int(signals.get("listCount") or 0)
+    subreports = int(signals.get("subreportCount") or 0)
+    section_count = int(layout.get("sectionCount") or len(sections) or 1)
+    if page_breaks:
+        print_score += 6
+        reason = f"{page_breaks} enabled/potential page break(s)"
+        if dynamic_breaks:
+            reason += f" ({dynamic_breaks} dynamic Disabled expression(s); manual)"
+        print_reasons.append(reason)
+    if lists:
+        print_score += 4
+        print_reasons.append(f"{lists} List data region(s)")
+    if subreports:
+        print_score += 4
+        print_reasons.append(f"{subreports} subreport(s)")
+    if section_count > 1:
+        print_score += 4
+        print_reasons.append(f"{section_count} report sections")
+    if any(s.get("pageWidth") or s.get("pageHeight") for s in sections):
+        print_score += 4
+        print_reasons.append("explicit physical page dimensions")
+    if any(s.get("footerHeight") for s in sections):
+        print_score += 2
+        print_reasons.append("page footer")
+    if any(s.get("headerHeight") for s in sections):
+        print_score += 1
+        print_reasons.append("page header")
+    if any(any((s.get("margins") or {}).values()) for s in sections):
+        print_score += 2
+        print_reasons.append("explicit page margins")
+
+    charts = sum(i.get("kind") == "chart" for i in report.get("bodyItems", []))
+    if charts:
+        dashboard_score += min(4, charts * 2)
+        dashboard_reasons.append(f"{charts} chart(s)")
+    parameters = len(report.get("parameters") or [])
+    if parameters:
+        dashboard_score += min(2, parameters)
+        dashboard_reasons.append(f"{parameters} interactive parameter(s)")
+    if not print_reasons:
+        dashboard_score += 1
+        dashboard_reasons.append("no print-specific pagination signals")
+
+    target = (
+        "report"
+        if print_score >= 4 and print_score > dashboard_score
+        else "workbook"
+    )
+    return {
+        "target": target,
+        "printScore": print_score,
+        "dashboardScore": dashboard_score,
+        "printSignals": print_reasons,
+        "dashboardSignals": dashboard_reasons,
+    }
+
+
+def _bundle_with_reports(bundle, reports):
+    return {**bundle, "reports": list(reports)}
+
+
+def resolve_bundle_targets(bundle, requested):
+    decisions = []
+    grouped = {"workbook": [], "report": []}
+    for report in bundle["reports"]:
+        evidence = resolve_target(report)
+        target = evidence["target"] if requested == "auto" else requested
+        decisions.append({
+            "report": report["report"],
+            "resolvedTarget": target,
+            **evidence,
+        })
+        grouped[target].append(report)
+    return grouped, decisions
+
+
+def _section_margins(section):
+    margins = section.get("margins") or {}
+    return {
+        side: _size_px(margins.get(side), 0)
+        for side in ("top", "right", "bottom", "left")
+    }
+
+
+def _report_config(reports, flags):
+    dimensions = []
+    margins = []
+    for report in reports:
+        sections = (report.get("layout") or {}).get("sections") or [{}]
+        for section in sections:
+            section_margins = _section_margins(section)
+            margins.extend(section_margins.values())
+            report_width = _size_px(
+                section.get("reportWidth")
+                or (report.get("layout") or {}).get("reportWidth"),
+                0,
+            )
+            body_height = _size_px(section.get("bodyHeight"), 0)
+            header_height = _size_px(section.get("headerHeight"), 0)
+            footer_height = _size_px(section.get("footerHeight"), 0)
+            required_height = (
+                body_height + header_height + footer_height
+                + section_margins["top"] + section_margins["bottom"]
+            )
+            page_width = _size_px(
+                section.get("pageWidth"),
+                report_width + section_margins["left"] + section_margins["right"]
+                if report_width else 816,
+            )
+            page_height = _size_px(
+                section.get("pageHeight"),
+                required_height
+                if body_height else 1056,
+            )
+            dimensions.append((page_width, page_height, report["report"]))
+            if section.get("pageHeight") and required_height > page_height + 0.001:
+                flags.add(
+                    report["report"],
+                    f"section {int(section.get('index') or 0) + 1} pagination",
+                    "RDL body plus panels/margins exceeds one physical page; "
+                    "the draft preserves item coordinates but does not infer "
+                    "dynamic overflow pages",
+                )
+
+            explicit = [value for value in section_margins.values() if value]
+            if explicit and len({round(value, 3) for value in explicit}) > 1:
+                flags.add(
+                    report["report"],
+                    f"section {int(section.get('index') or 0) + 1} margins",
+                    "Sigma report config has one uniform margin; asymmetric RDL "
+                    "margins are preserved in element coordinates but not in config",
+                )
+
+    widths = {round(item[0], 3) for item in dimensions}
+    heights = {round(item[1], 3) for item in dimensions}
+    if len(widths) > 1 or len(heights) > 1:
+        for _, _, report_name in dimensions:
+            flags.add(
+                report_name,
+                "report page size",
+                "this output bundle contains mixed page sizes; Sigma report config "
+                "is document-wide, so the largest canvas is used",
+            )
+    return {
+        "pageWidth": math.ceil(max(widths or {816})),
+        "pageHeight": math.ceil(max(heights or {1056})),
+        "margin": math.ceil(max(margins or [0])),
+    }
+
+
+def _ancestor_offsets(report, item, region):
+    section_index = int(item.get("sectionIndex") or 0)
+    sections = (report.get("layout") or {}).get("sections") or []
+    if section_index >= len(sections):
+        return 0.0, 0.0
+    entries = sections[section_index].get("itemPositions") or []
+    for entry in entries:
+        if (
+            entry.get("region") == region
+            and entry.get("name") == item.get("name")
+            and entry.get("kind") == item.get("kind")
+        ):
+            ancestors = entry.get("ancestorPositions") or []
+            return (
+                sum(_size_px(p.get("left"), 0) for p in ancestors),
+                sum(_size_px(p.get("top"), 0) for p in ancestors),
+            )
+    return 0.0, 0.0
+
+
+def _report_box(report, item, section, region, config, flags):
+    position = item.get("position") or {}
+    ancestor_left, ancestor_top = _ancestor_offsets(report, item, region)
+    margins = _section_margins(section)
+    panel_height = _size_px(
+        section.get("headerHeight") if region == "header"
+        else section.get("footerHeight"),
+        0,
+    )
+    default_heights = {
+        "textbox": 32, "chart": 240, "tablix": 192,
+        "gauge": 64, "map": 240, "subreport": 96,
+    }
+    left = _size_px(position.get("left"), 0) + ancestor_left
+    top = _size_px(position.get("top"), 0) + ancestor_top
+    left_margin = max(margins["left"], float(config.get("margin") or 0))
+    right_margin = max(margins["right"], float(config.get("margin") or 0))
+    x = left_margin + left
+    if region == "body":
+        top_margin = max(margins["top"], float(config.get("margin") or 0))
+        bottom_margin = max(
+            margins["bottom"], float(config.get("margin") or 0)
+        )
+        footer_height = _size_px(section.get("footerHeight"), 0)
+        y = top_margin + _size_px(section.get("headerHeight"), 0) + top
+        available_height = (
+            config["pageHeight"] - y - bottom_margin - footer_height
+        )
+    else:
+        y = top
+        available_height = panel_height - y
+    width = _size_px(
+        position.get("width"),
+        max(1, config["pageWidth"] - x - right_margin),
+    )
+    height = _size_px(
+        position.get("height"),
+        min(default_heights.get(item.get("kind"), 48), max(1, available_height)),
+    )
+    missing = [
+        key for key in ("top", "left", "width", "height")
+        if not position.get(key)
+    ]
+    if missing:
+        flags.add(
+            report["report"],
+            f"{region} {item.get('kind')} {item.get('name')}",
+            "RDL omitted " + ", ".join(missing)
+            + "; deterministic fallback geometry was used",
+        )
+    if x < 0 or y < 0 or width <= 0 or height <= 0:
+        raise ValueError(
+            f"{report['report']}/{item.get('name')}: invalid report geometry"
+        )
+    return {"x": x, "y": y, "width": width, "height": height}
+
+
+def _layout_element(element_id, box):
+    attrs = " ".join(
+        f'{key}="{_xml_number(box[key])}"'
+        for key in ("x", "y", "width", "height")
+    )
+    return f'  <Element elementId="{element_id}" {attrs}/>'
+
+
+def _static_text_element(item, rname, region, flags):
+    value = item.get("value")
+    if not value:
+        flags.add(rname, f"{region} textbox {item.get('name')}",
+                  "empty textbox omitted")
+        return None
+    if str(value).startswith("="):
+        flags.add(
+            rname,
+            f"{region} textbox {item.get('name')}",
+            "dynamic SSRS textbox expression is not safely authorable as report "
+            "text and was omitted",
+        )
+        return None
+    return {
+        "id": slug("txt", rname, region, item.get("sectionIndex"), item.get("name")),
+        "kind": "text",
+        "body": value,
+    }
+
+
+def build_report(bundle, dm_id, dm_element_ids, dm_element_index,
+                 name, folder_id, flags, schema_version=1):
+    """Build a Sigma fixed-layout report spec from parsed RDL geometry."""
+    config = _report_config(bundle["reports"], flags)
+    elements = []
+    pages = []
+    panels = []
+    roots = []
+
+    for report in bundle["reports"]:
+        rname = report["report"]
+        _flag_layout_degradations(report, "report", flags)
+        source_contexts = _source_contexts(
+            report, dm_id, dm_element_ids, dm_element_index
+        )
+        sections = (report.get("layout") or {}).get("sections") or [
+            {
+                "index": 0, "margins": {}, "headerHeight": None,
+                "footerHeight": None,
+            }
+        ]
+        page_ids = {}
+        for section in sections:
+            section_index = int(section.get("index") or 0)
+            page_id = slug("page", rname, section_index + 1)
+            page_ids[section_index] = page_id
+            pages.append({"id": page_id, "name": (
+                rname if len(sections) == 1
+                else f"{rname} · Section {section_index + 1}"
+            )})
+            page_lines = [f'<Page id="{page_id}">']
+            for item in report.get("bodyItems") or []:
+                if int(item.get("sectionIndex") or 0) != section_index:
+                    continue
+                kind = item.get("kind")
+                element = None
+                if kind == "textbox":
+                    element = _static_text_element(item, rname, "body", flags)
+                elif kind == "tablix":
+                    source = _source_for_item(
+                        item, source_contexts, flags, rname
+                    )
+                    if source:
+                        element = _tablix_element(
+                            item, rname, source["id"], source["name"], flags
+                        )
+                elif kind == "chart":
+                    source = _source_for_item(
+                        item, source_contexts, flags, rname
+                    )
+                    if source:
+                        report_chart_kind = CHART_KIND.get(
+                            (item.get("chartType") or "column").lower()
+                        )
+                        if report_chart_kind not in REPORT_SAFE_CHART_KINDS:
+                            flags.add(
+                                rname, f"chart {item.get('name')}",
+                                f"{report_chart_kind or item.get('chartType')} is not "
+                                "in the conservative Sigma report authoring baseline; "
+                                "chart was omitted",
+                            )
+                        else:
+                            element = _chart_element(
+                                item, rname, source["id"], source["name"], flags
+                            )
+                else:
+                    flags.add(
+                        rname, f"{kind} {item.get('name')}",
+                        item.get("flag", f"{kind} is unsupported and was omitted"),
+                    )
+                if element:
+                    elements.append(element)
+                    box = _report_box(
+                        report, item, section, "body", config, flags
+                    )
+                    page_lines.append(_layout_element(element["id"], box))
+            page_lines.append("</Page>")
+            roots.append("\n".join(page_lines))
+
+            for panel_type, source_items, height_key in (
+                ("header", report.get("pageHeaderItems") or [], "headerHeight"),
+                ("footer", report.get("pageFooterItems") or [], "footerHeight"),
+            ):
+                panel_height = _size_px(section.get(height_key), 0)
+                panel_items = [
+                    item for item in source_items
+                    if int(item.get("sectionIndex") or 0) == section_index
+                ]
+                if not panel_height and not panel_items:
+                    continue
+                if not panel_height:
+                    panel_height = 48
+                    flags.add(
+                        rname, f"section {section_index + 1} {panel_type}",
+                        "panel items exist without an RDL height; 48px was used",
+                    )
+                panel_id = slug("panel", rname, section_index + 1, panel_type)
+                panels.append({
+                    "id": panel_id,
+                    "type": panel_type,
+                    "title": f"{rname} {panel_type}",
+                    "pages": [page_id],
+                    "config": {"height": round(panel_height, 3)},
+                })
+                panel_lines = [
+                    f'<Panel id="{panel_id}" type="{panel_type}">'
+                ]
+                for item in panel_items:
+                    element = _static_text_element(
+                        item, rname, panel_type, flags
+                    )
+                    if not element:
+                        continue
+                    elements.append(element)
+                    box = _report_box(
+                        report, item, section, panel_type, config, flags
+                    )
+                    panel_lines.append(_layout_element(element["id"], box))
+                panel_lines.append("</Panel>")
+                roots.append("\n".join(panel_lines))
+
+        dependency_elements = [
+            source["element"] for source in source_contexts.values()
+        ]
+        for parameter in report.get("parameters") or []:
+            control = _control(
+                parameter, flags, rname, source_contexts
+            )
+            if control:
+                dependency_elements.append(control)
+        if dependency_elements:
+            dependency_page_id = slug("page", rname, "dependencies")
+            pages.append({
+                "id": dependency_page_id,
+                "name": f"{rname} · Dependencies",
+                "visibility": "hidden",
+            })
+            dependency_lines = [f'<Page id="{dependency_page_id}">']
+            inset = float(config.get("margin") or 0)
+            usable_width = max(1, config["pageWidth"] - 2 * inset)
+            usable_height = max(1, config["pageHeight"] - 2 * inset)
+            max_rows = max(1, int(usable_height // 64))
+            dependency_columns = max(
+                1, math.ceil(len(dependency_elements) / max_rows)
+            )
+            dependency_rows = max(
+                1, math.ceil(len(dependency_elements) / dependency_columns)
+            )
+            cell_width = usable_width / dependency_columns
+            cell_height = usable_height / dependency_rows
+            for index, element in enumerate(dependency_elements):
+                elements.append(element)
+                column = index % dependency_columns
+                row = index // dependency_columns
+                box = {
+                    "x": inset + column * cell_width,
+                    "y": inset + row * cell_height,
+                    "width": max(1, cell_width - 16),
+                    "height": max(1, cell_height - 8),
+                }
+                dependency_lines.append(_layout_element(element["id"], box))
+            dependency_lines.append("</Page>")
+            roots.append("\n".join(dependency_lines))
+
+    document = {
+        "schemaVersion": schema_version,
+        "kind": "report",
+        "config": config,
+        "elements": elements,
+        "pages": pages,
+        "panels": panels,
+        "layout": (
+            '<?xml version="1.0" encoding="utf-8"?>\n' + "\n".join(roots)
+        ),
+    }
+    spec = {"name": name, "folderId": folder_id, "document": document}
+    _validate_report(spec)
+    return spec
+
+
+def _validate_report(spec):
+    """Local report guard: flat elements, absolute bounds, exact placement."""
+    doc = spec["document"]
+    if doc.get("kind") != "report":
+        raise ValueError("report spec: document.kind must be report")
+    page_count = len(doc.get("pages") or [])
+    if page_count > 1000:
+        raise ValueError(
+            f"report spec: {page_count} pages exceeds the 1,000-page limit"
+        )
+    if re.search(
+        r"gridColumn|gridRow|gridTemplate|<(?:Container|TabbedContainer|Overlay)\b",
+        doc.get("layout", ""),
+    ):
+        raise ValueError("report spec: workbook grid/container syntax is forbidden")
+
+    element_ids = [item.get("id") for item in doc.get("elements") or []]
+    if len(element_ids) != len(set(element_ids)):
+        raise ValueError("report spec: duplicate element ids")
+    page_ids = {page["id"] for page in doc.get("pages") or []}
+    panel_by_id = {
+        panel["id"]: panel for panel in doc.get("panels") or []
+    }
+    panels_by_page = {page_id: {"header": [], "footer": []}
+                      for page_id in page_ids}
+    for panel in panel_by_id.values():
+        panel_type = panel.get("type")
+        if panel_type not in ("header", "footer"):
+            raise ValueError(
+                f"report spec: unsupported panel type {panel_type!r}"
+            )
+        for page_id in panel.get("pages") or []:
+            if page_id not in panels_by_page:
+                raise ValueError(
+                    f"report spec: panel references unknown page {page_id!r}"
+                )
+            panels_by_page[page_id][panel_type].append(panel)
+    for page_id, assignments in panels_by_page.items():
+        if any(len(values) > 1 for values in assignments.values()):
+            raise ValueError(
+                f"report spec: page {page_id!r} has duplicate header/footer panels"
+            )
+    fragment = re.sub(
+        r"^\s*<\?xml[^>]*\?>", "", doc.get("layout", ""), count=1
+    )
+    try:
+        root = ET.fromstring(f"<ReportLayout>{fragment}</ReportLayout>")
+    except ET.ParseError as exc:
+        raise ValueError(f"report spec: invalid layout XML: {exc}") from exc
+
+    placed = []
+    seen_pages = set()
+    seen_panels = set()
+    for layout_root in root:
+        if layout_root.tag == "Page":
+            root_id = layout_root.get("id")
+            if root_id not in page_ids:
+                raise ValueError(
+                    f"report spec: layout references unknown page {root_id!r}"
+                )
+            seen_pages.add(root_id)
+            bound_width = float(doc["config"]["pageWidth"])
+            bound_height = float(doc["config"]["pageHeight"])
+            margin = float(doc["config"].get("margin") or 0)
+            header_height = sum(
+                float((panel.get("config") or {}).get("height") or 0)
+                for panel in panels_by_page[root_id]["header"]
+            )
+            footer_height = sum(
+                float((panel.get("config") or {}).get("height") or 0)
+                for panel in panels_by_page[root_id]["footer"]
+            )
+            content_bounds = (
+                margin,
+                margin + header_height,
+                bound_width - margin,
+                bound_height - margin - footer_height,
+            )
+        elif layout_root.tag == "Panel":
+            root_id = layout_root.get("id")
+            panel = panel_by_id.get(root_id)
+            if not panel:
+                raise ValueError(
+                    f"report spec: layout references unknown panel {root_id!r}"
+                )
+            if layout_root.get("type") != panel.get("type"):
+                raise ValueError(f"report spec: panel type mismatch for {root_id}")
+            seen_panels.add(root_id)
+            bound_width = float(doc["config"]["pageWidth"])
+            bound_height = float((panel.get("config") or {}).get("height") or 0)
+            content_bounds = None
+        else:
+            raise ValueError(
+                f"report spec: unsupported layout root <{layout_root.tag}>"
+            )
+        for leaf in layout_root:
+            if leaf.tag != "Element" or list(leaf):
+                raise ValueError("report spec: layout leaves must be flat <Element>")
+            element_id = leaf.get("elementId")
+            placed.append(element_id)
+            try:
+                x, y, width, height = (
+                    float(leaf.get(key)) for key in ("x", "y", "width", "height")
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"report spec: non-numeric geometry for {element_id}"
+                ) from exc
+            if x < 0 or y < 0 or width <= 0 or height <= 0:
+                raise ValueError(
+                    f"report spec: invalid geometry for {element_id}"
+                )
+            if x + width > bound_width + 0.001 or y + height > bound_height + 0.001:
+                raise ValueError(
+                    f"report spec: {element_id} exceeds {layout_root.tag.lower()} bounds"
+                )
+            if content_bounds:
+                left, top, right, bottom = content_bounds
+                if (
+                    x < left - 0.001
+                    or y < top - 0.001
+                    or x + width > right + 0.001
+                    or y + height > bottom + 0.001
+                ):
+                    raise ValueError(
+                        f"report spec: {element_id} overlaps a page margin "
+                        "or assigned header/footer"
+                    )
+
+    if seen_pages != page_ids:
+        raise ValueError(
+            f"report spec: pages missing from layout {sorted(page_ids - seen_pages)}"
+        )
+    if seen_panels != set(panel_by_id):
+        raise ValueError(
+            "report spec: panels missing from layout "
+            f"{sorted(set(panel_by_id) - seen_panels)}"
+        )
+    if sorted(placed) != sorted(element_ids):
+        missing = set(element_ids) - set(placed)
+        dangling = set(placed) - set(element_ids)
+        duplicates = sorted({
+            item for item in placed if placed.count(item) > 1
+        })
+        raise ValueError(
+            "report spec: placement mismatch "
+            f"(missing={sorted(missing)}, dangling={sorted(dangling)}, "
+            f"duplicates={duplicates})"
+        )
+
+
+# ---------------------------------------------------------------------------
 # parity keys
 # ---------------------------------------------------------------------------
 
@@ -506,6 +1349,102 @@ def build_parity_keys(bundle):
     return out
 
 
+_TARGET_OUTPUT_SUFFIXES = (
+    "_workbook_spec.json",
+    "_report_spec.json",
+    "_target_resolution.json",
+)
+
+
+def _stage_text_output(path, content):
+    """Write and fsync one temporary file beside its final destination."""
+    destination = os.path.abspath(os.fspath(path))
+    directory = os.path.dirname(destination)
+    fd, temp_path = tempfile.mkstemp(
+        prefix=f".{os.path.basename(destination)}.",
+        suffix=".tmp",
+        dir=directory,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except Exception:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        raise
+    return destination, temp_path
+
+
+def _replace_outputs_transactionally(outputs, obsolete_paths=()):
+    """Replace a complete output set, then remove obsolete target artifacts.
+
+    Every payload is built and staged before any destination is touched.
+    Existing affected files are backed up so an I/O failure during the commit
+    can restore the preceding valid output set.
+    """
+    normalized_outputs = {
+        os.path.abspath(os.fspath(path)): content
+        for path, content in outputs.items()
+    }
+    obsolete = {
+        os.path.abspath(os.fspath(path))
+        for path in obsolete_paths
+    } - set(normalized_outputs)
+    affected = sorted(set(normalized_outputs) | obsolete)
+    staged = {}
+    backups = {}
+    existed = {}
+    mutations_started = False
+    try:
+        for path, content in normalized_outputs.items():
+            destination, temp_path = _stage_text_output(path, content)
+            staged[destination] = temp_path
+
+        for path in affected:
+            existed[path] = os.path.isfile(path)
+            if existed[path]:
+                fd, backup_path = tempfile.mkstemp(
+                    prefix=f".{os.path.basename(path)}.",
+                    suffix=".bak",
+                    dir=os.path.dirname(path),
+                )
+                os.close(fd)
+                shutil.copy2(path, backup_path)
+                backups[path] = backup_path
+
+        mutations_started = True
+        for path, temp_path in staged.items():
+            os.replace(temp_path, path)
+        for path in obsolete:
+            if os.path.isfile(path):
+                os.remove(path)
+    except Exception:
+        if mutations_started:
+            for path in affected:
+                try:
+                    if existed.get(path):
+                        backup_path = backups.pop(path, None)
+                        if backup_path:
+                            os.replace(backup_path, path)
+                    elif os.path.isfile(path):
+                        os.remove(path)
+                except OSError:
+                    # Preserve the original exception; any rollback failure is
+                    # still visible through the surviving backup/temp file.
+                    pass
+        raise
+    finally:
+        for temp_path in list(staged.values()) + list(backups.values()):
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+
+
+def _json_output(value):
+    return json.dumps(value, indent=2) + "\n"
+
+
 def main():
     ap = argparse.ArgumentParser(description="Convert SSRS bundle.json to Sigma specs")
     ap.add_argument("--bundle", required=True)
@@ -513,12 +1452,28 @@ def main():
     ap.add_argument("--folder-id", required=True, help="destination Sigma folder id")
     ap.add_argument("--dm-name", default="SSRS Migration")
     ap.add_argument("--wb-name", default="SSRS Migration")
+    ap.add_argument("--report-name",
+                    help="Sigma report name (defaults to --wb-name)")
+    ap.add_argument(
+        "--report-schema-version",
+        type=int,
+        default=1,
+        help="report document schemaVersion (offline default: 1)",
+    )
+    ap.add_argument(
+        "--target",
+        choices=("auto", "workbook", "report"),
+        default="workbook",
+        help="output resource; omitted remains workbook for compatibility",
+    )
     ap.add_argument("--data-model-id", help="server dataModelId (phase 4)")
     ap.add_argument("--dm-element-ids", help="JSON {elementName: serverId} read back after DM POST")
     ap.add_argument("--no-uppercase", action="store_true",
                     help="do NOT uppercase Custom SQL column refs (default assumes Snowflake)")
     ap.add_argument("--out-prefix", default="sigma")
     args = ap.parse_args()
+    if args.report_schema_version < 1:
+        ap.error("--report-schema-version must be a positive integer")
 
     with open(args.bundle) as fh:
         bundle = json.load(fh)
@@ -530,25 +1485,69 @@ def main():
     flags = Flags()
     dm_spec, dm_index = build_dm(bundle, args.connection_id, args.dm_name,
                                  args.folder_id, not args.no_uppercase, flags)
-    wb_spec = build_workbook(bundle, args.data_model_id, dm_element_ids, dm_index,
-                             args.wb_name, args.folder_id, flags)
+    grouped, decisions = resolve_bundle_targets(bundle, args.target)
+    wb_spec = None
+    report_spec = None
+    if grouped["workbook"]:
+        wb_spec = build_workbook(
+            _bundle_with_reports(bundle, grouped["workbook"]),
+            args.data_model_id, dm_element_ids, dm_index,
+            args.wb_name, args.folder_id, flags,
+        )
+    if grouped["report"]:
+        report_spec = build_report(
+            _bundle_with_reports(bundle, grouped["report"]),
+            args.data_model_id, dm_element_ids, dm_index,
+            args.report_name or args.wb_name, args.folder_id, flags,
+            schema_version=args.report_schema_version,
+        )
     parity = build_parity_keys(bundle)
 
-    with open(f"{args.out_prefix}_dm_spec.json", "w") as fh:
-        json.dump(dm_spec, fh, indent=2)
-    with open(f"{args.out_prefix}_workbook_spec.json", "w") as fh:
-        json.dump(wb_spec, fh, indent=2)
-    with open("parity_keys.json", "w") as fh:
-        json.dump(parity, fh, indent=2)
-    with open("conversion_report.md", "w") as fh:
-        fh.write(flags.report_md())
+    target_paths = {
+        suffix: f"{args.out_prefix}{suffix}"
+        for suffix in _TARGET_OUTPUT_SUFFIXES
+    }
+    dm_path = f"{args.out_prefix}_dm_spec.json"
+    outputs = {dm_path: _json_output(dm_spec)}
+    written = [dm_path]
+    if wb_spec is not None:
+        path = target_paths["_workbook_spec.json"]
+        outputs[path] = _json_output(wb_spec)
+        written.append(path)
+    if report_spec is not None:
+        path = target_paths["_report_spec.json"]
+        outputs[path] = _json_output(report_spec)
+        written.append(path)
+    if args.target == "auto":
+        path = target_paths["_target_resolution.json"]
+        outputs[path] = _json_output({
+            "requestedTarget": args.target,
+            "reports": decisions,
+        })
+        written.append(path)
+    outputs["parity_keys.json"] = _json_output(parity)
+    outputs["conversion_report.md"] = flags.report_md()
+    obsolete_paths = set(target_paths.values()) - set(outputs)
+    _replace_outputs_transactionally(outputs, obsolete_paths)
 
-    wb_doc = wb_spec["document"]
-    print(f"DM elements: {len(dm_spec['pages'][0]['elements'])}  "
-          f"workbook pages: {len(wb_doc['pages'])}  "
-          f"workbook elements: {len(wb_doc['elements'])}  flags: {len(flags.items)}")
-    print(f"wrote {args.out_prefix}_dm_spec.json, {args.out_prefix}_workbook_spec.json, "
-          "parity_keys.json, conversion_report.md")
+    summary = [f"DM elements: {len(dm_spec['pages'][0]['elements'])}"]
+    if wb_spec:
+        wb_doc = wb_spec["document"]
+        summary.extend([
+            f"workbook pages: {len(wb_doc['pages'])}",
+            f"workbook elements: {len(wb_doc['elements'])}",
+        ])
+    if report_spec:
+        report_doc = report_spec["document"]
+        summary.extend([
+            f"report pages: {len(report_doc['pages'])}",
+            f"report elements: {len(report_doc['elements'])}",
+        ])
+    summary.append(f"flags: {len(flags.items)}")
+    print("  ".join(summary))
+    print("wrote " + ", ".join(
+        written + ["parity_keys.json", "conversion_report.md"]
+    ))
     if flags.items:
         print("\n--- flags (also in conversion_report.md) ---")
         for r, w, m in flags.items:

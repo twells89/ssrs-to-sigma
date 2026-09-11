@@ -1,0 +1,243 @@
+"""Shape adapter for the Sigma WORKBOOK code representation.
+
+Workbook writes nest their document fields under ``document``. Data-model
+code representations do not use this adapter.
+"""
+
+DOC_KEYS = (
+    "schemaVersion", "pages", "elements", "overlays", "panels",
+    "kind", "layout", "settings", "agents",
+)
+LEGACY_THEME_KEYS = ("themeName", "themeOverrides")
+LEGACY_HORIZONTAL_ALIGN = {"start": "left", "middle": "center", "end": "right"}
+LEGACY_VERTICAL_ALIGN = {"start": "top", "middle": "center", "end": "bottom"}
+
+
+def _fold_legacy_theme(doc, source):
+    """themeName/themeOverrides -> settings.theme.{name,overrides}."""
+    name = doc.get("themeName") or source.get("themeName")
+    overrides = doc.get("themeOverrides") or source.get("themeOverrides")
+    has_ov = isinstance(overrides, dict) and bool(overrides)
+    if not name and not has_ov and not (set(LEGACY_THEME_KEYS) & set(doc)):
+        return doc
+
+    out = {k: v for k, v in doc.items() if k not in LEGACY_THEME_KEYS}
+    settings = dict(out.get("settings") or {})
+    theme = dict(settings.get("theme") or {})
+    if name and not theme.get("name"):
+        theme["name"] = name
+    if has_ov:
+        theme["overrides"] = {**(theme.get("overrides") or {}), **overrides}
+    if not theme:
+        return out
+    settings["theme"] = theme
+    out["settings"] = settings
+    return out
+
+
+def set_theme(doc, name=None, overrides=None):
+    """Set the workbook theme in the current shape."""
+    has_ov = isinstance(overrides, dict) and bool(overrides)
+    if not name and not has_ov:
+        return doc
+    settings = doc.setdefault("settings", {})
+    theme = settings.setdefault("theme", {})
+    if name:
+        theme["name"] = name
+    if has_ov:
+        theme["overrides"] = {**(theme.get("overrides") or {}), **overrides}
+    return doc
+
+
+def theme(spec):
+    """Read the theme from either the current or legacy shape."""
+    value = (document(spec).get("settings") or {}).get("theme") or {}
+    return {"name": value.get("name"), "overrides": value.get("overrides") or {}}
+
+
+def document(response):
+    """Return the workbook document from either the nested or legacy shape."""
+    if not isinstance(response, dict):
+        return {}
+    inner = response.get("document")
+    doc = inner if isinstance(inner, dict) else {
+        key: value for key, value in response.items() if key in DOC_KEYS
+    }
+    return _fold_legacy_theme(doc, response)
+
+
+def metadata(response):
+    if not isinstance(response, dict):
+        return {}
+    return {
+        key: value for key, value in response.items()
+        if key != "document"
+        and key not in DOC_KEYS
+        and key not in LEGACY_THEME_KEYS
+    }
+
+
+def workbook_elements(spec):
+    """Return flat elements, with read-only compatibility for old artifacts."""
+    doc = document(spec)
+    elements = doc.get("elements")
+    if isinstance(elements, list):
+        return [element for element in elements if isinstance(element, dict)]
+    return [
+        element
+        for page in doc.get("pages", [])
+        if isinstance(page, dict)
+        for element in page.get("elements", [])
+        if isinstance(element, dict)
+    ]
+
+
+def workbook_page_element_ids(spec):
+    """Return ``{page_id: [element_id, ...]}`` from workbook layout order."""
+    import re
+
+    result = {}
+    layout = str(document(spec).get("layout") or "")
+    for match in re.finditer(
+        r'<Page\b[^>]*\bid="([^"]*)"[^>]*>(.*?)</Page>', layout, re.S
+    ):
+        result[match.group(1)] = list(dict.fromkeys(
+            re.findall(
+                r'<(?:Element|Container|TabbedContainer|LayoutElement|GridContainer)\b'
+                r'[^>]*\belementId="([^"]*)"',
+                match.group(2),
+            )
+        ))
+    return result
+
+
+def workbook_page_by_element(spec):
+    """Return ``{element_id: page_metadata}``; layout is authoritative."""
+    doc = document(spec)
+    pages = [page for page in doc.get("pages", []) if isinstance(page, dict)]
+    pages_by_id = {page["id"]: page for page in pages if page.get("id")}
+    result = {}
+    for page_id, element_ids in workbook_page_element_ids(doc).items():
+        page = pages_by_id.get(page_id, {"id": page_id, "name": page_id})
+        for element_id in element_ids:
+            result.setdefault(element_id, page)
+    return result
+
+
+def workbook_elements_with_pages(spec):
+    page_by_element = workbook_page_by_element(spec)
+    return [
+        (element, page_by_element.get(element.get("id") or element.get("elementId")))
+        for element in workbook_elements(spec)
+    ]
+
+
+def _flatten_elements(doc):
+    if not isinstance(doc, dict) or not isinstance(doc.get("pages"), list):
+        return doc
+
+    nested = []
+    pages = []
+    for page in doc["pages"]:
+        page_copy = dict(page)
+        nested.extend(page_copy.pop("elements", []) or [])
+        pages.append(page_copy)
+
+    elements = []
+    seen = set()
+    for element in list(doc.get("elements") or []) + nested:
+        element_id = element.get("id") if isinstance(element, dict) else None
+        if element_id and element_id in seen:
+            continue
+        if element_id:
+            seen.add(element_id)
+        elements.append(element)
+    return {**doc, "pages": pages, "elements": elements}
+
+
+def canonicalize_layout(layout_xml):
+    """Map legacy layout aliases to live canonical tag names."""
+    import re
+
+    layout = str(layout_xml or "")
+    layout = re.sub(r'<(/?)LayoutElement\b', r'<\1Element', layout)
+    return re.sub(r'<(/?)GridContainer\b', r'<\1Container', layout)
+
+
+def _canonicalize_element(element):
+    if not isinstance(element, dict):
+        return element
+    kind = element.get("kind")
+    if kind == "text" and element.get("verticalAlign") in LEGACY_VERTICAL_ALIGN:
+        return {
+            **element,
+            "verticalAlign": LEGACY_VERTICAL_ALIGN[element["verticalAlign"]],
+        }
+    if kind == "kpi-chart" and isinstance(element.get("layout"), dict):
+        layout = element["layout"]
+        canonical = dict(layout)
+        if layout.get("anchor") in LEGACY_HORIZONTAL_ALIGN:
+            canonical["anchor"] = LEGACY_HORIZONTAL_ALIGN[layout["anchor"]]
+        if layout.get("verticalAnchor") in LEGACY_VERTICAL_ALIGN:
+            canonical["verticalAnchor"] = LEGACY_VERTICAL_ALIGN[
+                layout["verticalAnchor"]
+            ]
+        return element if canonical == layout else {
+            **element, "layout": canonical,
+        }
+    if kind == "tabbed-container" and isinstance(element.get("tabBar"), dict):
+        tab_bar = element["tabBar"]
+        if tab_bar.get("alignment") in LEGACY_HORIZONTAL_ALIGN:
+            return {
+                **element,
+                "tabBar": {
+                    **tab_bar,
+                    "alignment": LEGACY_HORIZONTAL_ALIGN[tab_bar["alignment"]],
+                },
+            }
+    if kind == "divider" and element.get("align") in LEGACY_VERTICAL_ALIGN:
+        mapping = (
+            LEGACY_HORIZONTAL_ALIGN
+            if element.get("direction") == "vertical"
+            else LEGACY_VERTICAL_ALIGN
+        )
+        return {**element, "align": mapping[element["align"]]}
+    return element
+
+
+def _canonicalize_overlay(overlay):
+    if not isinstance(overlay, dict) or not isinstance(overlay.get("drawer"), dict):
+        return overlay
+    drawer = overlay["drawer"]
+    if "position" not in drawer:
+        return overlay
+    return {
+        **overlay,
+        "drawer": {
+            key: value for key, value in drawer.items() if key != "position"
+        },
+    }
+
+
+def wrap(doc, extra=None):
+    """Build a current workbook request with canonical layout/element fields."""
+    out = dict(extra or {})
+    flattened = _flatten_elements(doc)
+    if isinstance(flattened, dict):
+        flattened = _fold_legacy_theme(flattened, flattened)
+        canonical = dict(flattened)
+        if isinstance(flattened.get("elements"), list):
+            canonical["elements"] = [
+                _canonicalize_element(element)
+                for element in flattened["elements"]
+            ]
+        if isinstance(flattened.get("overlays"), list):
+            canonical["overlays"] = [
+                _canonicalize_overlay(overlay)
+                for overlay in flattened["overlays"]
+            ]
+        if "layout" in flattened:
+            canonical["layout"] = canonicalize_layout(flattened["layout"])
+        flattened = canonical
+    out["document"] = flattened
+    return out
