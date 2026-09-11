@@ -536,6 +536,15 @@ def _validate_workbook(spec):
     no dangling layout reference. Cheap local checks that catch the mistakes a
     200-POST would otherwise mask (or reject opaquely)."""
     doc = spec["document"]
+    page_ids = [page.get("id") for page in doc.get("pages") or []]
+    duplicate_pages = sorted({
+        page_id for page_id in page_ids
+        if page_id and page_ids.count(page_id) > 1
+    })
+    if duplicate_pages:
+        raise ValueError(
+            f"workbook spec: duplicate page ids {duplicate_pages}"
+        )
     ids = [e.get("id") for e in doc["elements"]]
     seen, dupes = set(), set()
     for i in ids:
@@ -545,7 +554,17 @@ def _validate_workbook(spec):
     if dupes:
         raise ValueError(f"workbook spec: duplicate element ids {sorted(dupes)}")
     layout = doc.get("layout", "")
-    placed = set(re.findall(r'elementId="([^"]+)"', layout))
+    placed_all = re.findall(r'elementId="([^"]+)"', layout)
+    duplicate_placements = sorted({
+        element_id for element_id in placed_all
+        if placed_all.count(element_id) > 1
+    })
+    if duplicate_placements:
+        raise ValueError(
+            "workbook spec: elements placed more than once "
+            f"{duplicate_placements}"
+        )
+    placed = set(placed_all)
     idset = set(ids)
     unplaced = idset - placed
     dangling = placed - idset
