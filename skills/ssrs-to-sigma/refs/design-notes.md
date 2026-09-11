@@ -7,9 +7,9 @@ yet live-validated end-to-end against a real SSRS server or a live Sigma POST.**
 
 What that means concretely:
 - `parse_rdl.py` + `ssrs_expr.py` + `convert.py` + `scan_gaps.py` run clean on
-  `fixtures/SalesByRegion.rdl` and produce well-formed Sigma DM + workbook specs
-  that follow the canonical shapes in the `sigma-data-models` /
-  `sigma-workbooks` skills.
+  the fixtures and produce structurally checked Sigma DM + workbook/report
+  specs that follow `sigma-data-models`, `sigma-workbooks`, and
+  `sigma-reports`.
 - They have **not** been POSTed to a live Sigma org, and parity has not been run
   against rendered SSRS output. The Phase 3/4 post-and-readback gate and Phase 6
   parity gate are scaffolded and documented — run them on a real engagement and
@@ -26,11 +26,12 @@ Phase 0a  scan_gaps.py    → gap_report.md (AUTO/HINT/MANUAL/UNHANDLED shortlis
 Phase 1   parse_rdl.py    → bundle.json
 Phase 1.5 (reuse) DM-reuse check — does an existing Sigma DM already cover this
                   warehouse table? (warehouse FQN + column overlap)
-Phase 2   convert.py      → sigma_dm_spec.json, sigma_workbook_spec.json,
-                            parity_keys.json, conversion_report.md
+Phase 2   convert.py      → sigma_dm_spec.json, selected workbook/report spec(s),
+                            target resolution (auto), parity keys, flags
 Phase 3   POST DM spec → read back element ids → scan for type:error (hard gate)
-Phase 4   convert.py --data-model-id --dm-element-ids → POST workbook
-Phase 5/6 verify_parity.py → parity_report.md (hard gate)
+Phase 4   re-emit with ids → publish.py verify (default) → explicit --create,
+          readback/layout preservation, optional report PDF
+Phase 5/6 parity + source/Sigma RLS/CLS tests (hard gates)
 ```
 
 ## Key decisions
@@ -79,6 +80,32 @@ placed once, one row band each — not a reproduction of the RDL's pixel geometr
 data-model code-rep keeps `pages[].elements`; only the workbook surface moved to
 the `document` wrapper.
 
+Workbook emission is routed through local `scripts/lib/code_rep.py`, based on
+the shared migration adapter. It owns document wrapping, flat-element
+normalization, current theme placement, alignment aliases, and layout tag
+aliases. The data-model emitter never calls it.
+
+### Workbook or report target
+
+Omitted `--target` remains `workbook`. `report` forces fixed-layout output.
+`auto` resolves each source report and partitions mixed bundles. The resolver
+scores parsed evidence: page breaks, Lists, subreports, report-section count,
+physical page settings, margins, headers/footers versus charts and interactive
+parameters. It writes scores/reasons so the choice is auditable.
+
+A Sigma report has a separate contract and endpoint. Its document has
+`kind: report`, document-wide pixel config, flat elements, metadata-only
+pages/panels, and absolute leaf placement. Report sections map to pages and
+header/footer regions map to report panels. Known RDL boxes are converted at
+96 px/in and each emitted element is placed once. Hidden dependency pages hold
+base tables and controls. Unsupported or unsafe content is flagged and omitted;
+it is never disguised as a working table.
+
+The report schema version defaults to `1` so offline fixtures remain
+deterministic. It is not a live-version claim. Before a live build, GET a recent
+report spec with `?format=json` and pass its `document.schemaVersion` through
+`--report-schema-version`.
+
 ### RDL layout nesting (2008/2010 vs 2016+)
 `parse_rdl._iter_layouts()` resolves both the flat root-level `<Body>`/`<Page>`
 and the RDL 2016 `<ReportSections><ReportSection>` nesting, concatenating items
@@ -87,16 +114,17 @@ one, so namespace stripping alone does not cover it. A layout that parses to
 zero visuals while datasets/parameters exist emits a `warnings` entry and is
 scored MANUAL — the previous behavior silently lost every visual and scored the
 report AUTO. Multi-section reports currently flatten into one workbook page;
-mapping sections → separate pages is a possible future refinement.
+the report target maps sections to separate fixed pages.
 
 ## Hard problems / known gaps
 
 - **Stored-proc datasets** — `EXEC sp_x @p=1` doesn't run in Sigma's warehouse
   dialects. Inline the proc body as Custom SQL only if it's small and the
   customer hands it over; else escalate. Flagged.
-- **Pixel-perfect paginated layouts** — page headers/footers, page breaks,
-  banded subreport detail. These don't fit Sigma's grid dashboard model. Assess
-  as "redesign," not "convert."
+- **Pixel-perfect paginated layouts** — the report target preserves parsed
+  boxes, physical page config, and header/footer panels, but cannot guarantee
+  pagination, typography, dynamic text, or subreport behavior. It remains a
+  flagged draft until verify, readback, PDF inspection, and parity pass.
 - **`<Code>` VB blocks** (`=Code.Foo(...)`) — no analog; per-block manual.
 - **Multi-value parameter → SQL join** (`=Join(Parameters!X.Value, ",")`) —
   becomes a Sigma `list` control; the chart/filter uses the control reference.
@@ -111,7 +139,8 @@ mapping sections → separate pages is a possible future refinement.
 This skill deliberately leans on the shared migration toolkit rather than
 re-implementing:
 - **Canonical spec shapes** → defer to `sigma-data-models` (`reference/sources.md`,
-  `calc-columns.md`) and `sigma-workbooks` (`reference/specification/*`).
+  `calc-columns.md`), `sigma-workbooks` (`reference/specification/*`), and
+  `sigma-reports`.
 - **DM-reuse check (Phase 1.5)**, **post-and-readback gate**, **layout helpers**,
   **gap-scout subagent** → same patterns as `tableau-to-sigma` /
   `cognos-to-sigma`.
@@ -129,3 +158,15 @@ re-implementing:
   `User!UserID`, that's the RLS-port surface → Sigma user attributes. Ask the
   customer explicitly; never assume an estate has no security just because the
   RDL doesn't carry it.
+- **CLS** — RDL only shows fields the author could use. Inventory hidden source
+  fields and role grants separately, preserve warehouse/Sigma CLS, and test
+  representative allowed and denied identities after DM readback.
+
+`publish.py` defaults to `/spec/verify`; `--create` is the explicit persistent
+write boundary. Workbooks as Code and Reports as Code are private beta, reports
+require **Create, edit, and publish reports** permission, and reports currently
+have no DELETE endpoint. GET readback requests JSON explicitly and compares the
+complete normalized submitted/current document; only response-envelope
+metadata and benign layout XML whitespace are ignored. Saved verify/create/
+readback files and optional PDF are evidence inputs only. This repository has
+not established live proof.

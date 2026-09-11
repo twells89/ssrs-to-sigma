@@ -20,7 +20,7 @@ expectation, not a promise.
 | Chart — Scatter | `scatter-chart` | clean | |
 | Chart — Range / Funnel / Pyramid | KPI / bar substitution | hard | flagged |
 | Chart — Radar / Polar / Shape | redesign | hard | no analog — flagged |
-| **Gauge / GaugePanel** | KPI substitution | hard | flagged, table fallback |
+| **Gauge / GaugePanel** | KPI substitution | hard | flagged; explicit warning/omission |
 | **Map** (region / point) | region-map / point-map | hard | manual review — flagged |
 | **Subreport** | separate page / drillthrough | medium | multi-pass |
 | Textbox (title/free text) | `text` element | clean | header titles only |
@@ -50,15 +50,26 @@ expectation, not a promise.
 > **Control field names are the current workbooks-as-code shape.** A `list`
 > control carries flat `mode` / `selectionMode` / `values` (NOT the removed
 > `multiSelect` / `defaultValue`); its value-list `source` and the `filters`
-> binding to the base-table column it filters are emitted as **flags**, because
-> both depend on how the dataset SQL / `@parameter` was resolved. The converter
-> does not fake a column binding — flag, never fake.
+> binding are independent. The converter wires a value-list source only when a
+> parsed query names the same dataset as the converted primary source and its
+> value field exactly matches a base column, or when static values have an
+> exact same-name base column. A declared lookup dataset is never rebound to an
+> unrelated primary source; otherwise the control is flagged and omitted.
+> Target `filters`
+> remain flagged because they depend on resolving dataset SQL / `@parameter`.
+> The converter does not fake a column binding — flag, never fake.
 
 ## Why "flagged" matters
 
 Anything in the **hard** rows is emitted as a **loud flag** in
-`conversion_report.md` (and a table-fallback element in the workbook), never as
-a confidently-wrong conversion. A gauge silently turned into the wrong KPI, or a
+`conversion_report.md` (and, where useful, an explicit “not converted” text
+element in a workbook), never as a confidently-wrong data visualization. Report
+output omits unsupported items. A gauge silently turned into the wrong KPI, or a
 T-SQL proc that won't run in Snowflake, is worse than an explicit "a human must
 handle this." This is the shared contract across every sibling converter:
 **flag, never fake.**
+
+The report target uses the conservative `sigma-reports` support matrix:
+table/pivot, text, bar/line/area/scatter, and standard controls. Pie/donut and
+unknown chart kinds are omitted with flags until targeted report verify,
+readback, and PDF evidence establishes support.

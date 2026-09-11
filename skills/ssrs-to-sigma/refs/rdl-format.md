@@ -77,6 +77,9 @@ identically; you just won't get connection strings.
     <Height>…</Height>                                          of <Report>
   <Width>…</Width>                    (page width sits on <Report>)
   <Page>
+    <PageWidth/><PageHeight/>         → physical page dimensions
+    <TopMargin/><RightMargin/>        → normalized page margins
+    <BottomMargin/><LeftMargin/>
     <PageHeader><ReportItems>…        → pageHeaderItems
     <PageFooter><ReportItems>…        → pageFooterItems
 ```
@@ -149,9 +152,14 @@ Position: `<Top> <Left> <Width> <Height>` (inches, e.g. `"1.2in"`), plus
 - `<Subreport>` (`<ReportName>`) — embeds another report → separate page /
   drillthrough, multi-pass.
 - `<Rectangle>` / `<List>` — containers; the parser recurses into their nested
-  `<ReportItems>`.
+  `<ReportItems>`, records ancestor boxes, and counts Lists as a print signal.
 - `<Textbox>` — free text / titles (page-header title becomes a Sigma text
   element).
+
+Every recognized item now carries `sectionIndex` and a `position` box. The
+normalized layout inventory also records container ancestor positions so
+report output can preserve nested offsets. Missing RDL dimensions remain
+`null`; the report converter uses a deterministic fallback and emits a flag.
 
 ## What the parser emits (bundle.json)
 
@@ -169,6 +177,17 @@ bodyItems[]     tablix | chart | gauge | map | subreport | textbox
                 (concatenated across every <ReportSection> for 2016+ RDL)
 pageHeaderItems[]
 pageFooterItems[]
+layout {
+  reportWidth, bodyHeight, pageWidth, pageHeight,
+  margins, headerHeight, footerHeight, sectionCount,
+  pageBreaks[], listCount, subreportCount, itemPositions[],
+  sections [{
+    index, reportWidth, bodyHeight, pageWidth, pageHeight,
+    margins {top,right,bottom,left}, headerHeight, footerHeight,
+    pageBreaks[], listCount, subreportCount, itemPositions[]
+  }],
+  signals {pageBreakCount,listCount,subreportCount}
+}
 warnings[]      present ONLY when a structural miss is suspected (layout found
                 but zero visuals parsed while datasets/parameters exist)
 ```
@@ -176,8 +195,17 @@ warnings[]      present ONLY when a structural miss is suspected (layout found
 `fixtures/expected_bundle.json` is a real parse of `fixtures/SalesByRegion.rdl`
 (flat 2008/2010 layout) and `fixtures/expected_reportsections_bundle.json` is a
 real parse of `fixtures/ReportSections2016.rdl` (2016 `<ReportSections>` with a
-subreport + grouped Tablix + header/footer). Diff against both after changing
+subreport + grouped Tablix + header/footer).
+`fixtures/expected_printlayout_bundle.json` covers physical page metadata,
+margins, a List/page break/subreport, and nested item positions. Diff against
+all three after changing
 the parser — the offline suite in `tests/test_ssrs.py` does exactly this.
+
+`signals.pageBreakCount` excludes a page break whose `<Disabled>` value is the
+literal `true`. A dynamic expression such as
+`<Disabled>=Parameters!Breaks.Value</Disabled>` remains a potential page break
+and adds a parser warning/manual gate; the converter cannot evaluate it
+offline.
 
 ## Gotchas
 

@@ -68,6 +68,14 @@ def text(el, name=None):
     return node.text.strip()
 
 
+def _position(el):
+    """Return the RDL box without interpreting its physical unit."""
+    return {
+        "top": text(el, "Top"), "left": text(el, "Left"),
+        "width": text(el, "Width"), "height": text(el, "Height"),
+    }
+
+
 # ---------------------------------------------------------------------------
 # section parsers
 # ---------------------------------------------------------------------------
@@ -208,10 +216,7 @@ def parse_tablix(tablix):
         "rowGroups": row_groups,
         "columnGroups": col_groups,
         "valueExpressions": _aggregate_cells(tablix),
-        "position": {
-            "top": text(tablix, "Top"), "left": text(tablix, "Left"),
-            "width": text(tablix, "Width"), "height": text(tablix, "Height"),
-        },
+        "position": _position(tablix),
     }
 
 
@@ -239,33 +244,51 @@ def parse_chart(chart):
         "dataSetName": text(chart, "DataSetName"),
         "categoryExpressions": cat,
         "series": series,
-        "position": {
-            "top": text(chart, "Top"), "left": text(chart, "Left"),
-            "width": text(chart, "Width"), "height": text(chart, "Height"),
-        },
+        "position": _position(chart),
     }
 
 
-def parse_report_items(container):
+def parse_report_items(container, section_index=0, region="body", inventory=None,
+                       ancestors=None):
     """Walk a <ReportItems> container for the element kinds we convert."""
     items = []
+    inventory = inventory if inventory is not None else []
+    ancestors = list(ancestors or [])
     ri = child(container, "ReportItems")
     if ri is None:
         return items
     for el in ri:
         tag = _local(el.tag)
+        position = _position(el)
+        entry = {
+            "sectionIndex": section_index,
+            "region": region,
+            "kind": tag.lower(),
+            "name": el.get("Name"),
+            "position": position,
+        }
+        if ancestors:
+            entry["ancestorPositions"] = ancestors
+        inventory.append(entry)
         if tag == "Tablix":
-            items.append(parse_tablix(el))
+            item = parse_tablix(el)
+            item["sectionIndex"] = section_index
+            items.append(item)
         elif tag == "Chart":
-            items.append(parse_chart(el))
+            item = parse_chart(el)
+            item["sectionIndex"] = section_index
+            items.append(item)
         elif tag == "Gauge":
             items.append({"kind": "gauge", "name": el.get("Name"),
+                          "sectionIndex": section_index, "position": position,
                           "flag": "gauge -> KPI substitution (refs/viz-type-mapping.md)"})
         elif tag == "Map":
             items.append({"kind": "map", "name": el.get("Name"),
+                          "sectionIndex": section_index, "position": position,
                           "flag": "map -> region/point map, manual review"})
         elif tag == "Subreport":
             items.append({"kind": "subreport", "name": el.get("Name"),
+                          "sectionIndex": section_index, "position": position,
                           "reportName": text(el, "ReportName"),
                           "flag": "subreport -> separate page / drillthrough, multi-pass"})
         elif tag == "Textbox":
@@ -274,15 +297,18 @@ def parse_report_items(container):
                 v = text(run, "Value")
                 if v:
                     break
-            items.append({"kind": "textbox", "name": el.get("Name"), "value": v})
+            items.append({"kind": "textbox", "name": el.get("Name"), "value": v,
+                          "sectionIndex": section_index, "position": position})
         elif tag in ("Rectangle", "List"):
             # containers can nest report items
-            items.extend(parse_report_items(el))
+            items.extend(parse_report_items(
+                el, section_index, region, inventory, ancestors + [position]
+            ))
     return items
 
 
 def _iter_layouts(root):
-    """Yield the (Body, Page) pairs that carry the report's visuals.
+    """Yield the (Body, Page, owner) tuples that carry report visuals.
 
     RDL 2016+ (2016/01 schema, SSDT / Power BI Report Server) wraps the layout
     in <ReportSections><ReportSection><Body>/<Page>, and a report may carry
@@ -295,9 +321,59 @@ def _iter_layouts(root):
     sections = children(child(root, "ReportSections"), "ReportSection")
     if sections:
         for sec in sections:
-            yield child(sec, "Body"), child(sec, "Page")
+            yield child(sec, "Body"), child(sec, "Page"), sec
     else:
-        yield child(root, "Body"), child(root, "Page")
+        yield child(root, "Body"), child(root, "Page"), root
+
+
+def _page_breaks(container):
+    """Inventory explicit pagination directives without changing bodyItems."""
+    return [
+        {
+            "breakLocation": text(node, "BreakLocation"),
+            "disabled": text(node, "Disabled"),
+            "resetPageNumber": text(node, "ResetPageNumber"),
+        }
+        for node in descendants(container, "PageBreak")
+    ]
+
+
+def _page_break_state(page_break):
+    disabled = str(page_break.get("disabled") or "").strip()
+    if disabled.casefold() == "true":
+        return "disabled"
+    if disabled.startswith("="):
+        return "dynamic"
+    return "active"
+
+
+def _section_layout(root, owner, body, page, section_index, item_positions):
+    header = child(page, "PageHeader")
+    footer = child(page, "PageFooter")
+    lists = descendants(body, "List")
+    subreports = descendants(body, "Subreport")
+    return {
+        "index": section_index,
+        "reportWidth": text(owner, "Width") or text(root, "Width"),
+        "bodyHeight": text(body, "Height"),
+        "pageWidth": text(page, "PageWidth"),
+        "pageHeight": text(page, "PageHeight"),
+        "margins": {
+            "top": text(page, "TopMargin"),
+            "right": text(page, "RightMargin"),
+            "bottom": text(page, "BottomMargin"),
+            "left": text(page, "LeftMargin"),
+        },
+        "headerHeight": text(header, "Height"),
+        "footerHeight": text(footer, "Height"),
+        "pageBreaks": _page_breaks(body),
+        "listCount": len(lists),
+        "subreportCount": len(subreports),
+        "itemPositions": [
+            item for item in item_positions
+            if item["sectionIndex"] == section_index
+        ],
+    }
 
 
 def parse_rdl(path):
@@ -311,16 +387,30 @@ def parse_rdl(path):
     body_items = []
     page_header_items = []
     page_footer_items = []
+    item_positions = []
+    section_layouts = []
     layout_found = False
     # Concatenate items across every ReportSection (multi-section 2016 reports)
     # and across the flat legacy layout — one flat inventory per report.
-    for body, page in _iter_layouts(root):
+    layouts = list(_iter_layouts(root))
+    for section_index, (body, page, owner) in enumerate(layouts):
         if body is not None or page is not None:
             layout_found = True
-        body_items.extend(parse_report_items(body))
+        body_items.extend(parse_report_items(
+            body, section_index, "body", item_positions
+        ))
         if page is not None:
-            page_header_items.extend(parse_report_items(child(page, "PageHeader")))
-            page_footer_items.extend(parse_report_items(child(page, "PageFooter")))
+            page_header_items.extend(parse_report_items(
+                child(page, "PageHeader"), section_index, "header", item_positions
+            ))
+            page_footer_items.extend(parse_report_items(
+                child(page, "PageFooter"), section_index, "footer", item_positions
+            ))
+        section_layouts.append(
+            _section_layout(
+                root, owner, body, page, section_index, item_positions
+            )
+        )
 
     if not layout_found:
         # No <Body>/<Page> under <Report> OR any <ReportSection> — this is a
@@ -332,6 +422,47 @@ def parse_rdl(path):
 
     datasets = parse_datasets(root)
     parameters = parse_parameters(root)
+    report_width = text(root, "Width")
+    if not report_width and section_layouts:
+        report_width = section_layouts[0]["reportWidth"]
+    first_section = section_layouts[0] if section_layouts else {
+        "bodyHeight": None,
+        "pageWidth": None,
+        "pageHeight": None,
+        "margins": {"top": None, "right": None, "bottom": None, "left": None},
+        "headerHeight": None,
+        "footerHeight": None,
+    }
+    layout = {
+        "reportWidth": report_width,
+        # First-section aliases keep the common one-section case simple while
+        # `sections` retains every value for multi-section reports.
+        "bodyHeight": first_section["bodyHeight"],
+        "pageWidth": first_section["pageWidth"],
+        "pageHeight": first_section["pageHeight"],
+        "margins": first_section["margins"],
+        "headerHeight": first_section["headerHeight"],
+        "footerHeight": first_section["footerHeight"],
+        "sectionCount": len(section_layouts),
+        "pageBreaks": [
+            page_break
+            for section in section_layouts
+            for page_break in section["pageBreaks"]
+        ],
+        "listCount": sum(s["listCount"] for s in section_layouts),
+        "subreportCount": sum(s["subreportCount"] for s in section_layouts),
+        "itemPositions": item_positions,
+        "sections": section_layouts,
+        "signals": {
+            "pageBreakCount": sum(
+                _page_break_state(page_break) != "disabled"
+                for s in section_layouts
+                for page_break in s["pageBreaks"]
+            ),
+            "listCount": sum(s["listCount"] for s in section_layouts),
+            "subreportCount": sum(s["subreportCount"] for s in section_layouts),
+        },
+    }
 
     warnings = []
     if not (body_items or page_header_items or page_footer_items):
@@ -345,6 +476,15 @@ def parse_rdl(path):
                 "likely an unrecognized layout wrapper; the visual inventory may be incomplete"
             )
             print(f"!! {path}: {warnings[-1]}", file=sys.stderr)
+    dynamic_page_breaks = sum(
+        _page_break_state(page_break) == "dynamic"
+        for page_break in layout["pageBreaks"]
+    )
+    if dynamic_page_breaks:
+        warnings.append(
+            f"{dynamic_page_breaks} page break Disabled value(s) are dynamic "
+            "expressions — resolve pagination manually"
+        )
 
     report = {
         "report": name,
@@ -355,9 +495,8 @@ def parse_rdl(path):
         "bodyItems": body_items,
         "pageHeaderItems": page_header_items,
         "pageFooterItems": page_footer_items,
+        "layout": layout,
     }
-    # Emit `warnings` only when non-empty so a clean legacy parse stays
-    # byte-identical to expected_bundle.json (the golden regression).
     if warnings:
         report["warnings"] = warnings
     return report

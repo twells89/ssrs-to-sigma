@@ -152,7 +152,8 @@
             "left": "0.2in",
             "width": "2.5in",
             "height": "1in"
-          }
+          },
+          "sectionIndex": 0
         },
         {
           "kind": "chart",
@@ -175,17 +176,144 @@
             "left": "0.2in",
             "width": "5in",
             "height": "1in"
-          }
+          },
+          "sectionIndex": 0
         }
       ],
       "pageHeaderItems": [
         {
           "kind": "textbox",
           "name": "Title",
-          "value": "Sales by Region"
+          "value": "Sales by Region",
+          "sectionIndex": 0,
+          "position": {
+            "top": null,
+            "left": null,
+            "width": null,
+            "height": null
+          }
         }
       ],
-      "pageFooterItems": []
+      "pageFooterItems": [],
+      "layout": {
+        "reportWidth": "6in",
+        "bodyHeight": "2.5in",
+        "pageWidth": null,
+        "pageHeight": null,
+        "margins": {
+          "top": null,
+          "right": null,
+          "bottom": null,
+          "left": null
+        },
+        "headerHeight": "0.5in",
+        "footerHeight": null,
+        "sectionCount": 1,
+        "pageBreaks": [],
+        "listCount": 0,
+        "subreportCount": 0,
+        "itemPositions": [
+          {
+            "sectionIndex": 0,
+            "region": "body",
+            "kind": "tablix",
+            "name": "SalesMatrix",
+            "position": {
+              "top": "1.2in",
+              "left": "0.2in",
+              "width": "2.5in",
+              "height": "1in"
+            }
+          },
+          {
+            "sectionIndex": 0,
+            "region": "body",
+            "kind": "chart",
+            "name": "SalesByRegionChart",
+            "position": {
+              "top": "0.1in",
+              "left": "0.2in",
+              "width": "5in",
+              "height": "1in"
+            }
+          },
+          {
+            "sectionIndex": 0,
+            "region": "header",
+            "kind": "textbox",
+            "name": "Title",
+            "position": {
+              "top": null,
+              "left": null,
+              "width": null,
+              "height": null
+            }
+          }
+        ],
+        "sections": [
+          {
+            "index": 0,
+            "reportWidth": "6in",
+            "bodyHeight": "2.5in",
+            "pageWidth": null,
+            "pageHeight": null,
+            "margins": {
+              "top": null,
+              "right": null,
+              "bottom": null,
+              "left": null
+            },
+            "headerHeight": "0.5in",
+            "footerHeight": null,
+            "pageBreaks": [],
+            "listCount": 0,
+            "subreportCount": 0,
+            "itemPositions": [
+              {
+                "sectionIndex": 0,
+                "region": "body",
+                "kind": "tablix",
+                "name": "SalesMatrix",
+                "position": {
+                  "top": "1.2in",
+                  "left": "0.2in",
+                  "width": "2.5in",
+                  "height": "1in"
+                }
+              },
+              {
+                "sectionIndex": 0,
+                "region": "body",
+                "kind": "chart",
+                "name": "SalesByRegionChart",
+                "position": {
+                  "top": "0.1in",
+                  "left": "0.2in",
+                  "width": "5in",
+                  "height": "1in"
+                }
+              },
+              {
+                "sectionIndex": 0,
+                "region": "header",
+                "kind": "textbox",
+                "name": "Title",
+                "position": {
+                  "top": null,
+                  "left": null,
+                  "width": null,
+                  "height": null
+                }
+              }
+            ]
+          }
+        ],
+        "signals": {
+          "pageBreakCount": 0,
+          "listCount": 0,
+          "subreportCount": 0
+        }
+      }
     }
   ]
 }

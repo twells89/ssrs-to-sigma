@@ -1,0 +1,96 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Report xmlns="http://schemas.microsoft.com/sqlserver/reporting/2016/01/reportdefinition"
+        xmlns:rd="http://schemas.microsoft.com/SQLServer/reporting/reportdesigner">
+  <DataSets>
+    <DataSet Name="Invoices">
+      <Query>
+        <DataSourceName>Billing</DataSourceName>
+        <CommandText>SELECT InvoiceNumber, Amount FROM dbo.Invoices</CommandText>
+      </Query>
+      <Fields>
+        <Field Name="InvoiceNumber">
+          <DataField>InvoiceNumber</DataField>
+          <rd:TypeName>System.String</rd:TypeName>
+        </Field>
+        <Field Name="Amount">
+          <DataField>Amount</DataField>
+          <rd:TypeName>System.Decimal</rd:TypeName>
+        </Field>
+      </Fields>
+    </DataSet>
+  </DataSets>
+  <ReportSections>
+    <ReportSection>
+      <Body>
+        <ReportItems>
+          <List Name="InvoiceList">
+            <Top>0.25in</Top>
+            <Left>0.5in</Left>
+            <Width>6.5in</Width>
+            <Height>1in</Height>
+            <PageBreak>
+              <BreakLocation>Between</BreakLocation>
+            </PageBreak>
+            <ReportItems>
+              <Textbox Name="InvoiceLabel">
+                <Top>0.1in</Top>
+                <Left>0.2in</Left>
+                <Width>2in</Width>
+                <Height>0.3in</Height>
+                <Paragraphs><Paragraph><TextRuns><TextRun>
+                  <Value>Invoice detail</Value>
+                </TextRun></TextRuns></Paragraph></Paragraphs>
+              </Textbox>
+            </ReportItems>
+          </List>
+          <Subreport Name="LineItems">
+            <ReportName>InvoiceLineItems</ReportName>
+            <Top>1.5in</Top>
+            <Left>0.5in</Left>
+            <Width>6.5in</Width>
+            <Height>6in</Height>
+          </Subreport>
+        </ReportItems>
+        <Height>9.5in</Height>
+      </Body>
+      <Width>7.5in</Width>
+      <Page>
+        <PageWidth>8.5in</PageWidth>
+        <PageHeight>11in</PageHeight>
+        <TopMargin>0.5in</TopMargin>
+        <RightMargin>0.5in</RightMargin>
+        <BottomMargin>0.5in</BottomMargin>
+        <LeftMargin>0.5in</LeftMargin>
+        <PageHeader>
+          <Height>0.4in</Height>
+          <ReportItems>
+            <Textbox Name="Header">
+              <Top>0.05in</Top>
+              <Left>0.5in</Left>
+              <Width>6.5in</Width>
+              <Height>0.25in</Height>
+              <Paragraphs><Paragraph><TextRuns><TextRun>
+                <Value>Invoice</Value>
+              </TextRun></TextRuns></Paragraph></Paragraphs>
+            </Textbox>
+          </ReportItems>
+        </PageHeader>
+        <PageFooter>
+          <Height>0.3in</Height>
+          <ReportItems>
+            <Textbox Name="Footer">
+              <Top>0.02in</Top>
+              <Left>0.5in</Left>
+              <Width>6.5in</Width>
+              <Height>0.2in</Height>
+              <Paragraphs><Paragraph><TextRuns><TextRun>
+                <Value>Confidential</Value>
+              </TextRun></TextRuns></Paragraph></Paragraphs>
+            </Textbox>
+          </ReportItems>
+        </PageFooter>
+      </Page>
+    </ReportSection>
+  </ReportSections>
+  <Width>7.5in</Width>
+</Report>
