@@ -18,8 +18,8 @@ data-model plus workbook and/or fixed-layout report specs from RDL:
 - `convert.py` turns that into a Sigma DM spec (Custom-SQL element) and,
   according to `--target workbook|report|auto`, responsive workbook pages,
   absolute-pixel report pages, or both for a mixed bundle. The matrix Tablix
-  becomes a `pivot-table`, the column chart a `bar-chart`, and parameters
-  become controls.
+  becomes a `pivot-table`, the column chart a `bar-chart`, and parameters with
+  safely resolved sources become controls.
 
 What it has **not** done yet: a live POST to a Sigma org, or a data-parity run
 against rendered SSRS output. Phases 3–6 are scaffolded and documented as live
@@ -76,6 +76,11 @@ verification and requires `--create` for a persistent POST.
 Report output defaults to `schemaVersion: 1` for offline compatibility only;
 live work must fetch a recent report spec with `?format=json` and pass its
 current version through `convert.py --report-schema-version`.
+Each converted SSRS dataset gets its own base/source dependency. Tablix and
+chart items bind only to their declared `dataSetName`; query-backed parameter
+lists may bind to their declared lookup dataset and exact value field. Static
+valid-value lists are currently omitted with a flag rather than exposed as
+unrestricted data-driven choices.
 
 ## Design contract
 
@@ -89,6 +94,12 @@ Dataset SQL is preserved **verbatim**: the
 converter does not gamble on a cross-dialect SQL rewrite. Parity is a hard gate:
 a migration is green only when `verify_parity.py` passes against numbers taken
 from SSRS itself.
+
+Conversion output replacement is transactional: all specs are built and
+validated, staged beside their destinations, atomically replaced, and only
+then are obsolete target artifacts removed. A failed conversion preserves the
+last valid output set. Report validation also rejects documents above Sigma's
+1,000-page limit before any output is replaced.
 
 The required migration gates are: reuse an existing governed DM where
 possible; POST/read back a new DM and stop on errors; finish and preserve

@@ -57,16 +57,26 @@ dialect/param pass before it will compile against the target warehouse. That's
 expected and documented — fix it, then run the Phase 3 gate.
 
 ### Parameters → controls, filter wiring is manual
-Each `<ReportParameter>` becomes a page control (date / list / number /
-checkbox). The actual *filtering* (the `WHERE … @param` in the SSRS SQL) must be
-re-expressed as a Sigma element filter or a control-bound formula — flagged, not
-auto-wired, because it depends on how you resolved the SQL above.
+Each safely resolvable `<ReportParameter>` becomes a page control (date / list /
+number / checkbox). The actual *filtering* (the `WHERE … @param` in the SSRS
+SQL) must be re-expressed as a Sigma element filter or a control-bound formula
+— flagged, not auto-wired, because it depends on how you resolved the SQL above.
 
-### Workbook architecture (the 5-element pattern)
-Per report → one page: a **base table** sourcing the DM element
-(`source.kind: data-model`), then pivot/table/chart elements sourcing the base
-table by element id, plus controls. Downstream elements reference base columns
-with the `[<BaseName>/<Col>]` prefix. This mirrors the sibling converters.
+List value sources have a stricter gate. A query-backed list binds only to the
+dataset named by `validValuesQuery.dataSet` and the exact
+`validValuesQuery.valueField`, and only when that dataset produced a source
+context. Static valid values are not converted into unrestricted data-driven
+choices: until a current literal-source contract is proven, the control is
+flagged and omitted.
+
+### Workbook architecture (per-dataset dependency pattern)
+Per report → one page with one **base table per converted SSRS dataset**
+(`source.kind: data-model`). Each pivot/table/chart then sources the base table
+named by its own `dataSetName`; a missing or ambiguous dependency is flagged and
+the item is omitted rather than guessed. Downstream elements reference base
+columns with the `[<BaseName>/<Col>]` prefix. All base tables, safe controls,
+and visuals are included in the flat element collection and layout exactly
+once.
 
 The emitted spec is the **current workbooks-as-code shape**:
 `{name, folderId, document}` with `document.kind: workbook`, a single **flat**
@@ -98,13 +108,25 @@ A Sigma report has a separate contract and endpoint. Its document has
 pages/panels, and absolute leaf placement. Report sections map to pages and
 header/footer regions map to report panels. Known RDL boxes are converted at
 96 px/in and each emitted element is placed once. Hidden dependency pages hold
-base tables and controls. Unsupported or unsafe content is flagged and omitted;
-it is never disguised as a working table.
+all dataset base tables and safely resolved controls. Unsupported or unsafe
+content is flagged and omitted; it is never disguised as a working table.
 
 The report schema version defaults to `1` so offline fixtures remain
 deterministic. It is not a live-version claim. Before a live build, GET a recent
 report spec with `?format=json` and pass its `document.schemaVersion` through
 `--report-schema-version`.
+The local validator enforces the 1,000-page maximum across visible and hidden
+pages and fails clearly rather than partitioning.
+
+### Transactional conversion output
+
+`convert.py` parses, builds, and validates the complete selected output set
+before touching an existing result. It writes and fsyncs temporary files beside
+their destinations, atomically replaces desired outputs, and removes obsolete
+target artifacts only after successful replacement. Existing affected files
+are backed up for rollback if the commit phase encounters an I/O failure. A
+parse/build/validation failure therefore leaves the previous valid files
+unchanged.
 
 ### RDL layout nesting (2008/2010 vs 2016+)
 `parse_rdl._iter_layouts()` resolves both the flat root-level `<Body>`/`<Page>`

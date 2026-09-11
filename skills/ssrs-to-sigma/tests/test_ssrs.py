@@ -70,6 +70,122 @@ def _convert_report(bundle):
     return report, flags
 
 
+def _multi_dataset_bundle():
+    def dataset(name, fields):
+        return {
+            "name": name,
+            "dataSourceName": "Warehouse",
+            "commandText": f"SELECT {', '.join(fields)} FROM {name}",
+            "isStoredProc": False,
+            "queryParameters": [],
+            "fields": [{
+                "name": field,
+                "dataField": field,
+                "expression": None,
+                "calculated": False,
+                "typeName": "System.String",
+            } for field in fields],
+        }
+
+    return {
+        "version": 1,
+        "reports": [{
+            "report": "MultiSource",
+            "sourceFile": "MultiSource.rdl",
+            "dataSources": [],
+            "dataSets": [
+                dataset("Orders", ["Region", "Amount"]),
+                dataset("Targets", ["Region", "Target"]),
+                dataset("RegionLookup", ["Code", "Label"]),
+            ],
+            "parameters": [{
+                "name": "Region",
+                "dataType": "String",
+                "multiValue": True,
+                "nullable": False,
+                "prompt": "Region",
+                "defaultValues": [],
+                "validValuesQuery": {
+                    "dataSet": "RegionLookup",
+                    "valueField": "Code",
+                    "labelField": "Label",
+                },
+                "validValuesStatic": None,
+            }],
+            "bodyItems": [{
+                "kind": "tablix",
+                "name": "OrdersTable",
+                "shape": "table",
+                "dataSetName": "Orders",
+                "rowGroups": [],
+                "columnGroups": [],
+                "valueExpressions": ["=Fields!Amount.Value"],
+                "sectionIndex": 0,
+                "position": {
+                    "top": "1in", "left": "0.5in",
+                    "width": "3in", "height": "2in",
+                },
+            }, {
+                "kind": "chart",
+                "name": "TargetChart",
+                "chartType": "Column",
+                "dataSetName": "Targets",
+                "categoryExpressions": ["=Fields!Region.Value"],
+                "series": [{
+                    "name": "Target",
+                    "values": ["=Sum(Fields!Target.Value)"],
+                }],
+                "sectionIndex": 0,
+                "position": {
+                    "top": "3.5in", "left": "0.5in",
+                    "width": "5in", "height": "2.5in",
+                },
+            }],
+            "pageHeaderItems": [],
+            "pageFooterItems": [],
+            "layout": {
+                "reportWidth": "7.5in",
+                "bodyHeight": "9in",
+                "pageWidth": "8.5in",
+                "pageHeight": "11in",
+                "margins": {
+                    "top": "0.5in", "right": "0.5in",
+                    "bottom": "0.5in", "left": "0.5in",
+                },
+                "headerHeight": None,
+                "footerHeight": None,
+                "sectionCount": 1,
+                "pageBreaks": [],
+                "listCount": 0,
+                "subreportCount": 0,
+                "itemPositions": [],
+                "sections": [{
+                    "index": 0,
+                    "reportWidth": "7.5in",
+                    "bodyHeight": "9in",
+                    "pageWidth": "8.5in",
+                    "pageHeight": "11in",
+                    "margins": {
+                        "top": "0.5in", "right": "0.5in",
+                        "bottom": "0.5in", "left": "0.5in",
+                    },
+                    "headerHeight": None,
+                    "footerHeight": None,
+                    "pageBreaks": [],
+                    "listCount": 0,
+                    "subreportCount": 0,
+                    "itemPositions": [],
+                }],
+                "signals": {
+                    "pageBreakCount": 0,
+                    "listCount": 0,
+                    "subreportCount": 0,
+                },
+            },
+        }],
+    }
+
+
 class LegacyGoldenTest(unittest.TestCase):
     def test_legacy_bundle_unchanged(self):
         """The 2008/2010-style flat <Body> parse must match its golden."""
@@ -280,7 +396,7 @@ class WorkbookSpecShapeTest(unittest.TestCase):
         self.assertEqual(lists, [])
         self.assertTrue(any(
             where == "parameter Region"
-            and "does not match" in message
+            and "no converted source context" in message
             for _report, where, message in self.flags.items
         ))
         dates = [c for c in controls if c["controlType"] == "date-range"]
@@ -386,7 +502,7 @@ class ListControlSourceTest(unittest.TestCase):
             },
         }
         control = convert._control(
-            param, convert.Flags(), "Report", self.source
+            param, convert.Flags(), "Report", {"Orders": self.source}
         )
         self.assertEqual(control["source"]["columnId"], "col-code")
 
@@ -400,25 +516,136 @@ class ListControlSourceTest(unittest.TestCase):
             },
         }
         flags = convert.Flags()
-        self.assertIsNone(convert._control(param, flags, "Report", self.source))
+        self.assertIsNone(convert._control(
+            param, flags, "Report", {"Orders": self.source}
+        ))
         self.assertTrue(any(
             "unrelated table" in message
             for _report, _where, message in flags.items
         ))
 
-    def test_static_values_require_exact_parameter_column(self):
+    def test_query_value_field_must_match_an_exact_source_column(self):
+        param = {
+            **self.base_param,
+            "validValuesQuery": {
+                "dataSet": "Orders",
+                "valueField": "code",
+                "labelField": "Region",
+            },
+        }
+        flags = convert.Flags()
+        self.assertIsNone(convert._control(
+            param, flags, "Report", {"Orders": self.source}
+        ))
+        self.assertTrue(any(
+            "no safely resolved value-list source" in message
+            for _report, _where, message in flags.items
+        ))
+
+    def test_static_values_are_omitted_until_literal_source_is_proven(self):
         param = {
             **self.base_param,
             "validValuesStatic": ["East", "West"],
         }
-        control = convert._control(
-            param, convert.Flags(), "Report", self.source
-        )
-        self.assertEqual(control["source"]["columnId"], "col-region")
-        missing = {**param, "name": "Territory"}
+        flags = convert.Flags()
         self.assertIsNone(convert._control(
-            missing, convert.Flags(), "Report", self.source
+            param, flags, "Report", {"Orders": self.source}
         ))
+        self.assertTrue(any(
+            "static valid values" in message
+            and "control was omitted" in message
+            for _report, _where, message in flags.items
+        ))
+
+
+class MultiDatasetSourceBindingTest(unittest.TestCase):
+    def setUp(self):
+        self.bundle = _multi_dataset_bundle()
+        self.workbook, self.workbook_flags = _convert(self.bundle)
+        self.report, self.report_flags = _convert_report(self.bundle)
+
+    def _assert_dataset_bindings(self, spec):
+        doc = spec["document"]
+        bases = {
+            element["name"].split(" · ")[1].removesuffix(" Base"): element
+            for element in doc["elements"]
+            if element.get("source", {}).get("kind") == "data-model"
+        }
+        self.assertEqual(set(bases), {"Orders", "Targets", "RegionLookup"})
+
+        orders = next(
+            element for element in doc["elements"]
+            if element["id"] == "tbx-multisource-orderstable"
+        )
+        target = next(
+            element for element in doc["elements"]
+            if element["id"] == "chart-multisource-targetchart"
+        )
+        control = next(
+            element for element in doc["elements"]
+            if element.get("kind") == "control"
+        )
+        self.assertEqual(
+            orders["source"]["elementId"], bases["Orders"]["id"]
+        )
+        self.assertEqual(
+            target["source"]["elementId"], bases["Targets"]["id"]
+        )
+        self.assertEqual(
+            control["source"]["source"]["elementId"],
+            bases["RegionLookup"]["id"],
+        )
+        lookup_code = next(
+            column for column in bases["RegionLookup"]["columns"]
+            if column["name"] == "Code"
+        )
+        self.assertEqual(control["source"]["columnId"], lookup_code["id"])
+
+        placements = re.findall(
+            r'elementId="([^"]+)"', doc.get("layout", "")
+        )
+        for base in bases.values():
+            self.assertEqual(placements.count(base["id"]), 1)
+
+    def test_workbook_binds_each_visual_and_lookup_control_to_its_dataset(self):
+        self._assert_dataset_bindings(self.workbook)
+
+    def test_report_binds_and_places_all_dataset_dependencies(self):
+        self._assert_dataset_bindings(self.report)
+        hidden_pages = [
+            page for page in self.report["document"]["pages"]
+            if page.get("visibility") == "hidden"
+        ]
+        self.assertEqual(
+            [page["name"] for page in hidden_pages],
+            ["MultiSource · Dependencies"],
+        )
+
+    def test_ambiguous_or_unknown_item_dataset_is_not_guessed(self):
+        for dataset_name in (None, "Missing"):
+            with self.subTest(dataSetName=dataset_name):
+                bundle = json.loads(json.dumps(self.bundle))
+                item = bundle["reports"][0]["bodyItems"][0]
+                if dataset_name is None:
+                    item.pop("dataSetName")
+                else:
+                    item["dataSetName"] = dataset_name
+                workbook, flags = _convert(bundle)
+                self.assertNotIn(
+                    "tbx-multisource-orderstable",
+                    {
+                        element["id"]
+                        for element in workbook["document"]["elements"]
+                    },
+                )
+                self.assertTrue(any(
+                    "omitted" in message
+                    and (
+                        "multiple converted datasets" in message
+                        or "no converted source context" in message
+                    )
+                    for _report, _where, message in flags.items
+                ))
 
 
 class GroupedTableTest(unittest.TestCase):
@@ -569,6 +796,17 @@ class ReportSpecTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "margin|footer"):
             convert._validate_report(bad)
 
+    def test_validator_rejects_more_than_one_thousand_pages(self):
+        bad = json.loads(json.dumps(self.spec))
+        bad["document"]["pages"] = [
+            {"id": f"page-{index}", "name": f"Page {index}"}
+            for index in range(1001)
+        ]
+        with self.assertRaisesRegex(
+            ValueError, r"1001 pages exceeds the 1,000-page limit"
+        ):
+            convert._validate_report(bad)
+
 
 class ConvertCliTargetTest(unittest.TestCase):
     def _run(self, target=None, extra=None):
@@ -671,6 +909,44 @@ class ConvertCliTargetTest(unittest.TestCase):
             self.assertTrue((workdir / "sigma_workbook_spec.json").is_file())
             self.assertFalse((workdir / "sigma_report_spec.json").exists())
             self.assertFalse((workdir / "sigma_target_resolution.json").exists())
+        finally:
+            temp.cleanup()
+
+    def test_failed_rerun_preserves_last_valid_output_set(self):
+        temp, workdir = self._run("auto")
+        try:
+            output_paths = [
+                workdir / "sigma_dm_spec.json",
+                workdir / "sigma_workbook_spec.json",
+                workdir / "sigma_report_spec.json",
+                workdir / "sigma_target_resolution.json",
+                workdir / "parity_keys.json",
+                workdir / "conversion_report.md",
+            ]
+            before = {path: path.read_bytes() for path in output_paths}
+            bundle_path = workdir / "bundle.json"
+            bundle = _load(bundle_path)
+            bundle["reports"] = [
+                bundle["reports"][0],
+                bundle["reports"][0],
+            ]
+            bundle_path.write_text(json.dumps(bundle), encoding="utf-8")
+
+            result = subprocess.run([
+                sys.executable, os.path.join(SCRIPTS, "convert.py"),
+                "--bundle", str(bundle_path),
+                "--connection-id", "CONN",
+                "--folder-id", "FOLDER",
+                "--target", "workbook",
+                "--out-prefix", str(workdir / "sigma"),
+            ], cwd=workdir, check=False, stdout=subprocess.PIPE,
+               stderr=subprocess.PIPE, text=True)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(
+                {path: path.read_bytes() for path in output_paths},
+                before,
+            )
         finally:
             temp.cleanup()
 

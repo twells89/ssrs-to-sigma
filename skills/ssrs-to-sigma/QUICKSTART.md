@@ -21,14 +21,26 @@ python3 scripts/convert.py --bundle /tmp/bundle.json \
 cat /tmp/sigma_dm_spec.json /tmp/sigma_workbook_spec.json /tmp/conversion_report.md
 ```
 
-You should see a `pivot-table` (the matrix Tablix), a `bar-chart`, three
-controls, and a flag list noting the T-SQL/parameter work.
+You should see a `pivot-table` (the matrix Tablix), a `bar-chart`, two
+date-range controls, and a flag list noting the T-SQL/parameter work. The
+Region list is omitted because its declared `RegionList` dataset is not present
+in the fixture.
 
 Omitting `--target` is identical to `--target workbook`. Use
 `--target report` for fixed pages, or `--target auto` to partition each source
 report by objective print/dashboard signals. Mixed auto bundles write both
 `/tmp/sigma_workbook_spec.json` and `/tmp/sigma_report_spec.json` plus
 `/tmp/sigma_target_resolution.json`.
+The converter builds and validates the complete result before staging and
+atomically replacing output files; obsolete target artifacts are removed only
+after successful replacements. A failed rerun leaves the previous valid files
+intact.
+
+Every converted SSRS dataset becomes a separate base/source dependency, and
+each Tablix or chart uses its declared `dataSetName`. Query-backed list
+parameters use only their declared dataset and exact value field when that
+source exists. Static valid-value lists are omitted with an explicit flag until
+a supported literal-source contract is proven.
 
 The offline report `schemaVersion` default is `1`. For a live workflow, GET a
 recent report spec as JSON, copy `document.schemaVersion`, and reconvert with
@@ -38,6 +50,9 @@ recent report spec as JSON, copy `document.schemaVersion`, and reconvert with
 curl -sf -H "Authorization: Bearer $SIGMA_API_TOKEN" \
   "$SIGMA_BASE_URL/v2/reports/<reference-report-id>/spec?format=json"
 ```
+
+Local validation rejects a report with more than 1,000 total pages (including
+hidden dependency pages); the converter does not partition oversized output.
 
 ## Against a real estate
 

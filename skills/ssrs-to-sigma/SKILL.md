@@ -7,7 +7,7 @@ description: >-
   recreate them in Sigma. Provides a customer-runnable export step, RDL XML
   parsing into a bundle, SSRS-expression translation, target selection, and
   conversion to a Sigma data model plus workbook and/or fixed-layout report
-  (Tablix matrix→pivot, table→table, charts, parameters→controls), with a
+  (Tablix matrix→pivot, table→table, charts, safe parameters→controls), with a
   parity-verification scaffold. Translates what maps cleanly
   and flags what doesn't (stored procs, custom VB, gauges/maps/subreports,
   paginated layouts) instead of emitting wrong logic.
@@ -143,9 +143,11 @@ bundle emits both `_workbook_spec.json` and `_report_spec.json`, grouped by
 resolved target, plus `_target_resolution.json` with scores and reasons.
 Literal page breaks with `Disabled=true` do not score; dynamic `Disabled`
 expressions remain potential print signals and are flagged for manual review.
-Each successful run removes obsolete workbook/report/resolution files for the
-same `--out-prefix` before writing, so changing target mode cannot leave a
-stale publishable spec behind.
+The converter builds and validates every selected spec before touching output,
+stages all files beside their destinations, atomically replaces the successful
+set, and only then removes obsolete workbook/report/resolution artifacts for
+the same `--out-prefix`. A failed rerun preserves the previous valid output
+set, so changing target mode cannot leave a stale publishable spec behind.
 `--report-schema-version` defaults to `1` only for offline compatibility.
 Before a live report verify/create, GET a recent report representation with
 `?format=json`, read its `document.schemaVersion`, and pass that current value;
@@ -157,7 +159,8 @@ the selected `_workbook_spec.json` and/or `_report_spec.json`,
 
 `sigma_workbook_spec.json` is the **current workbooks-as-code** shape:
 `{name, folderId, document}` where `document` has `kind: workbook`, a **flat**
-`elements` array (base table → pivot/table/chart + controls, per report), a
+`elements` array (one base table per converted SSRS dataset, plus
+pivot/table/chart elements and safe controls), a
 metadata-only `pages` array, and a `layout` XML string that places every
 element exactly once on a 24-column grid. (The data-model spec keeps its
 `pages[].elements` nesting — only the *workbook* surface changed.) The
@@ -169,10 +172,17 @@ The report spec follows the separate `sigma-reports` contract:
 flat elements, metadata-only pages/panels, and absolute
 `x`/`y`/`width`/`height` XML. It never uses workbook grid syntax. RDL
 header/footer items become report panels; sections become pages; a hidden
-dependency page holds the base table and parameter controls. Missing geometry
-and unsupported report items are flagged; subreports, gauges, maps, dynamic
-text, and chart kinds outside the conservative report baseline are omitted,
-not replaced with fake parity.
+dependency page holds every required dataset base table and safe parameter
+control. Tablix and chart elements bind only to their declared `dataSetName`;
+missing or ambiguous dataset dependencies cause an explicit flag and omission,
+never a fallback to an unrelated source. Query-backed list controls use only
+their declared dataset and exact value field. Static valid-value lists are
+flagged and omitted until a supported literal-source shape is proven. Missing
+geometry and unsupported report items are flagged; subreports, gauges, maps,
+dynamic text, and chart kinds outside the conservative report baseline are
+omitted, not replaced with fake parity. Local validation rejects more than
+1,000 total report pages, including hidden dependency pages; oversized output
+is not partitioned.
 
 **Read `conversion_report.md` before POSTing.** The converter preserves dataset
 SQL **verbatim** — it does not translate T-SQL dialect or rewrite `@parameters`
@@ -304,7 +314,7 @@ users. Missing RLS/CLS evidence is a blocker, not a clean result.
 `pivot-table` (`rowsBy`/`columnsBy` entries use `columnId`) · Tablix table →
 `table` · column/bar/
 line/area/pie/doughnut/scatter charts → matching Sigma chart · report
-parameters → date-range/list/number/checkbox controls · clean VB expressions
+parameters with safe sources → date-range/list/number/checkbox controls · clean VB expressions
 (`IIf`→`If`, `Switch`, aggregates, scope-arg drop) · page-header titles → text.
 The report target uses a narrower conservative chart baseline and flags/omits
 unproven report element kinds.
@@ -314,7 +324,8 @@ shared datasets · T-SQL dialect & `@parameter` SQL (preserved verbatim, you
 translate) · custom VB `Code.*` · `RunningValue`/`Previous`/window aggregates ·
 `Lookup`/`Globals!`/`ReportItems!` · gauges → KPI · maps → region/point map ·
 subreports → page/drillthrough · radar/polar/funnel charts · mixed-grain Tablix ·
-pagination, typography, or dynamic layout behavior not proven by RDL geometry.
+pagination, typography, or dynamic layout behavior not proven by RDL geometry ·
+static or unresolved list valid-value sources.
 
 ## Gotchas baked into the scripts (don't re-learn these)
 

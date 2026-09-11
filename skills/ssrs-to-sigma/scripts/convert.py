@@ -15,9 +15,9 @@ Modeling choices (documented in refs/design-notes.md):
     auto-translated across warehouse dialects, and T-SQL `@parameters` are NOT
     rewritten. Both are surfaced as loud flags. This is deliberate: a silent,
     wrong SQL rewrite is worse than an honest "translate this before POST".
-  * Each report becomes one workbook page: a base table sourcing the DM
-    element, then a pivot-table per matrix Tablix, a table per table Tablix,
-    and a chart per Chart. Report parameters become page controls.
+  * Each report becomes one workbook page: one base table per converted SSRS
+    dataset, then each Tablix/Chart sources the base named by its dataSetName.
+    Safely resolvable report parameters become page controls.
   * Aggregate expressions in Tablix value cells / chart series are translated
     by ssrs_expr.translate() and surfaced as flags when not a clean 1:1.
 
@@ -33,7 +33,9 @@ import json
 import math
 import os
 import re
+import shutil
 import sys
+import tempfile
 import xml.etree.ElementTree as ET
 
 import ssrs_expr
@@ -177,15 +179,16 @@ def _control_type(param):
     return "list"
 
 
-def _control(param, flags, rname, source_context=None):
+def _control(param, flags, rname, source_contexts=None):
     """Build a schema-correct control element.
 
     The widget/value fields are emitted with their CURRENT (workbooks-as-code)
     names — `mode` / `selectionMode` / `values` on a list, not the removed
     `multiSelect` / `defaultValue`. A query-backed list source is wired only
-    when its declared dataset is the converted primary dataset and its value
-    field exactly matches a base column; a static list requires an exact
-    same-name column. Otherwise the control is flagged and omitted. Target filter
+    when its declared dataset has a converted source context and its value
+    field exactly matches a base column. Static valid values are omitted until
+    a current literal-source shape is proven. Otherwise the control is flagged
+    and omitted. Target filter
     wiring still depends on the resolved dataset SQL / `@parameter` and remains
     a loud manual flag — flag, never fake.
     """
@@ -211,28 +214,31 @@ def _control(param, flags, rname, source_context=None):
                       "default is an expression (e.g. =Today()) — set the control default by hand")
         valid_query = param.get("validValuesQuery")
         valid_static = param.get("validValuesStatic")
-        source_field = None
         if valid_query:
             declared_dataset = valid_query.get("dataSet")
-            actual_dataset = (
-                source_context.get("dataSetName")
-                if source_context else None
+            source_context = (
+                (source_contexts or {}).get(declared_dataset)
+                if declared_dataset else None
             )
-            if not declared_dataset or declared_dataset != actual_dataset:
+            if source_context is None:
                 flags.add(
                     rname,
                     f"parameter {param['name']}",
                     "list valid-values dataset "
-                    f"{declared_dataset!r} does not match the converted primary "
-                    f"dataset {actual_dataset!r}; control was omitted rather than "
-                    "binding it to an unrelated table",
+                    f"{declared_dataset!r} has no converted source context; "
+                    "control was omitted rather than binding an unrelated table",
                 )
                 return None
             source_field = valid_query.get("valueField")
         elif valid_static is not None:
-            # Static values are safe to retain only when an exact, same-source
-            # parameter column is known. Do not guess Region -> RegionName.
-            source_field = param.get("name")
+            flags.add(
+                rname,
+                f"parameter {param['name']}",
+                "static valid values require a proven current literal value-list "
+                "source shape; control was omitted rather than exposing "
+                "unrestricted data-driven choices",
+            )
+            return None
         else:
             flags.add(
                 rname,
@@ -241,13 +247,10 @@ def _control(param, flags, rname, source_context=None):
                 "omitted rather than guessing a value-list column",
             )
             return None
-        source_column = None
-        if source_context:
-            source_column = next((
-                column for column in source_context.get("columns") or []
-                if str(column.get("name", "")).casefold()
-                == str(source_field or "").casefold()
-            ), None)
+        source_column = next((
+            column for column in source_context.get("columns") or []
+            if column.get("name") == source_field
+        ), None)
         if source_column:
             ctl["source"] = {
                 "kind": "source",
@@ -276,54 +279,87 @@ def _control(param, flags, rname, source_context=None):
     return ctl
 
 
-def _source_context(rep, dm_id, dm_element_ids, dm_element_index):
-    """Build the shared base-table dependency for a workbook or report."""
+def _source_contexts(rep, dm_id, dm_element_ids, dm_element_index):
+    """Build one base-table dependency per converted SSRS dataset."""
     rname = rep["report"]
     idx = dm_element_index.get(rname, {})
     if not idx:
-        return None
+        return {}
 
-    primary_ds = None
-    for item in rep["bodyItems"]:
-        if item.get("dataSetName"):
-            primary_ds = item["dataSetName"]
-            break
-    primary_ds = primary_ds or next(iter(idx))
-    dm_meta = idx.get(primary_ds) or next(iter(idx.values()))
-    if dm_element_ids and dm_meta["name"] in dm_element_ids:
-        dm_el_server_id = dm_element_ids[dm_meta["name"]]
-    else:
-        dm_el_server_id = "{{%s_ID}}" % slug(
-            dm_meta["elementId"]
-        ).upper().replace("-", "_")
-
-    base_id = slug("base", rname)
-    base_name = f"{rname} Base"
-    base_cols = [
-        {
-            "id": slug("c", rname, fname),
-            "name": fname,
-            "formula": f"[{dm_meta['name']}/{fname}]",
-        }
-        for fname in dm_meta["fields"]
-    ]
-    return {
-        "element": {
-            "id": base_id,
-            "kind": "table",
-            "name": base_name,
-            "source": {
-                "kind": "data-model",
-                "dataModelId": dm_id or "{{DATA_MODEL_ID}}",
-                "elementId": dm_el_server_id,
+    contexts = {}
+    single_dataset = len(idx) == 1
+    for dataset_name, dm_meta in idx.items():
+        if dm_element_ids and dm_meta["name"] in dm_element_ids:
+            dm_el_server_id = dm_element_ids[dm_meta["name"]]
+        else:
+            dm_el_server_id = "{{%s_ID}}" % slug(
+                dm_meta["elementId"]
+            ).upper().replace("-", "_")
+        base_id = (
+            slug("base", rname)
+            if single_dataset else slug("base", rname, dataset_name)
+        )
+        base_name = (
+            f"{rname} Base"
+            if single_dataset else f"{rname} · {dataset_name} Base"
+        )
+        base_cols = [
+            {
+                "id": slug("c", rname, dataset_name, fname),
+                "name": fname,
+                "formula": f"[{dm_meta['name']}/{fname}]",
+            }
+            for fname in dm_meta["fields"]
+        ]
+        contexts[dataset_name] = {
+            "element": {
+                "id": base_id,
+                "kind": "table",
+                "name": base_name,
+                "source": {
+                    "kind": "data-model",
+                    "dataModelId": dm_id or "{{DATA_MODEL_ID}}",
+                    "elementId": dm_el_server_id,
+                },
+                "columns": base_cols,
             },
+            "id": base_id,
+            "name": base_name,
             "columns": base_cols,
-        },
-        "id": base_id,
-        "name": base_name,
-        "columns": base_cols,
-        "dataSetName": primary_ds,
-    }
+            "dataSetName": dataset_name,
+        }
+    return contexts
+
+
+def _source_for_item(item, source_contexts, flags, rname):
+    dataset_name = item.get("dataSetName")
+    if dataset_name:
+        source = source_contexts.get(dataset_name)
+        if source is None:
+            flags.add(
+                rname,
+                f"{item.get('kind')} {item.get('name')}",
+                f"dataset {dataset_name!r} has no converted source context; "
+                "item was omitted",
+            )
+        return source
+    if len(source_contexts) == 1:
+        return next(iter(source_contexts.values()))
+    if not source_contexts:
+        flags.add(
+            rname,
+            f"{item.get('kind')} {item.get('name')}",
+            "item has no dataSetName and no converted dataset source is "
+            "available; item was omitted",
+        )
+        return None
+    flags.add(
+        rname,
+        f"{item.get('kind')} {item.get('name')}",
+        "item has no dataSetName and the report has multiple converted "
+        "datasets; item was omitted rather than guessing a source",
+    )
+    return None
 
 
 def _flag_layout_degradations(report, target, flags):
@@ -388,24 +424,21 @@ def build_workbook(bundle, dm_id, dm_element_ids, dm_element_index,
             flags.add(rname, "parse", w)
         if not rep.get("bodyItems") and (rep.get("dataSets") or rep.get("parameters")):
             flags.add(rname, "report body",
-                      "no report visuals parsed — only a base table will be emitted; "
+                      "no report visuals parsed — only dataset dependencies and "
+                      "safe controls will be emitted; "
                       "check the RDL layout / ReportSections nesting before trusting this workbook")
-        source = _source_context(
+        source_contexts = _source_contexts(
             rep, dm_id, dm_element_ids, dm_element_index
         )
-        if source is None:
-            continue
 
         page_id = slug("page", rname)
-        base_id = source["id"]
-        base_name = source["name"]
-        base_cols = source["columns"]
-        base_table = source["element"]
-        elements = [base_table]
+        elements = [
+            source["element"] for source in source_contexts.values()
+        ]
 
         # controls
         for p in rep["parameters"]:
-            control = _control(p, flags, rname, source)
+            control = _control(p, flags, rname, source_contexts)
             if control:
                 elements.append(control)
 
@@ -424,9 +457,21 @@ def build_workbook(bundle, dm_id, dm_element_ids, dm_element_index,
         for it in rep["bodyItems"]:
             kind = it.get("kind")
             if kind == "tablix":
-                elements.append(_tablix_element(it, rname, base_id, base_name, flags))
+                source = _source_for_item(
+                    it, source_contexts, flags, rname
+                )
+                if source:
+                    elements.append(_tablix_element(
+                        it, rname, source["id"], source["name"], flags
+                    ))
             elif kind == "chart":
-                elements.append(_chart_element(it, rname, base_id, base_name, flags))
+                source = _source_for_item(
+                    it, source_contexts, flags, rname
+                )
+                if source:
+                    elements.append(_chart_element(
+                        it, rname, source["id"], source["name"], flags
+                    ))
             elif kind in ("gauge", "map", "subreport"):
                 flags.add(rname, f"{kind} {it.get('name')}", it.get("flag", f"{kind} not auto-converted"))
                 elements.append({
@@ -944,7 +989,7 @@ def build_report(bundle, dm_id, dm_element_ids, dm_element_index,
     for report in bundle["reports"]:
         rname = report["report"]
         _flag_layout_degradations(report, "report", flags)
-        source = _source_context(
+        source_contexts = _source_contexts(
             report, dm_id, dm_element_ids, dm_element_index
         )
         sections = (report.get("layout") or {}).get("sections") or [
@@ -970,30 +1015,33 @@ def build_report(bundle, dm_id, dm_element_ids, dm_element_index,
                 element = None
                 if kind == "textbox":
                     element = _static_text_element(item, rname, "body", flags)
-                elif kind == "tablix" and source:
-                    element = _tablix_element(
-                        item, rname, source["id"], source["name"], flags
+                elif kind == "tablix":
+                    source = _source_for_item(
+                        item, source_contexts, flags, rname
                     )
-                elif kind == "chart" and source:
-                    report_chart_kind = CHART_KIND.get(
-                        (item.get("chartType") or "column").lower()
-                    )
-                    if report_chart_kind not in REPORT_SAFE_CHART_KINDS:
-                        flags.add(
-                            rname, f"chart {item.get('name')}",
-                            f"{report_chart_kind or item.get('chartType')} is not "
-                            "in the conservative Sigma report authoring baseline; "
-                            "chart was omitted",
-                        )
-                    else:
-                        element = _chart_element(
+                    if source:
+                        element = _tablix_element(
                             item, rname, source["id"], source["name"], flags
                         )
-                elif kind in ("tablix", "chart"):
-                    flags.add(
-                        rname, f"{kind} {item.get('name')}",
-                        "no converted dataset is available; item omitted",
+                elif kind == "chart":
+                    source = _source_for_item(
+                        item, source_contexts, flags, rname
                     )
+                    if source:
+                        report_chart_kind = CHART_KIND.get(
+                            (item.get("chartType") or "column").lower()
+                        )
+                        if report_chart_kind not in REPORT_SAFE_CHART_KINDS:
+                            flags.add(
+                                rname, f"chart {item.get('name')}",
+                                f"{report_chart_kind or item.get('chartType')} is not "
+                                "in the conservative Sigma report authoring baseline; "
+                                "chart was omitted",
+                            )
+                        else:
+                            element = _chart_element(
+                                item, rname, source["id"], source["name"], flags
+                            )
                 else:
                     flags.add(
                         rname, f"{kind} {item.get('name')}",
@@ -1050,7 +1098,16 @@ def build_report(bundle, dm_id, dm_element_ids, dm_element_index,
                 panel_lines.append("</Panel>")
                 roots.append("\n".join(panel_lines))
 
-        if source or report.get("parameters"):
+        dependency_elements = [
+            source["element"] for source in source_contexts.values()
+        ]
+        for parameter in report.get("parameters") or []:
+            control = _control(
+                parameter, flags, rname, source_contexts
+            )
+            if control:
+                dependency_elements.append(control)
+        if dependency_elements:
             dependency_page_id = slug("page", rname, "dependencies")
             pages.append({
                 "id": dependency_page_id,
@@ -1058,13 +1115,6 @@ def build_report(bundle, dm_id, dm_element_ids, dm_element_index,
                 "visibility": "hidden",
             })
             dependency_lines = [f'<Page id="{dependency_page_id}">']
-            dependency_elements = []
-            if source:
-                dependency_elements.append(source["element"])
-            for parameter in report.get("parameters") or []:
-                control = _control(parameter, flags, rname, source)
-                if control:
-                    dependency_elements.append(control)
             inset = float(config.get("margin") or 0)
             usable_width = max(1, config["pageWidth"] - 2 * inset)
             usable_height = max(1, config["pageHeight"] - 2 * inset)
@@ -1112,6 +1162,11 @@ def _validate_report(spec):
     doc = spec["document"]
     if doc.get("kind") != "report":
         raise ValueError("report spec: document.kind must be report")
+    page_count = len(doc.get("pages") or [])
+    if page_count > 1000:
+        raise ValueError(
+            f"report spec: {page_count} pages exceeds the 1,000-page limit"
+        )
     if re.search(
         r"gridColumn|gridRow|gridTemplate|<(?:Container|TabbedContainer|Overlay)\b",
         doc.get("layout", ""),
@@ -1275,16 +1330,100 @@ def build_parity_keys(bundle):
     return out
 
 
-def _remove_stale_target_outputs(out_prefix):
-    """Prevent a prior target mode's spec from surviving a successful rerun."""
-    for suffix in (
-        "_workbook_spec.json",
-        "_report_spec.json",
-        "_target_resolution.json",
-    ):
-        path = f"{out_prefix}{suffix}"
-        if os.path.isfile(path):
-            os.remove(path)
+_TARGET_OUTPUT_SUFFIXES = (
+    "_workbook_spec.json",
+    "_report_spec.json",
+    "_target_resolution.json",
+)
+
+
+def _stage_text_output(path, content):
+    """Write and fsync one temporary file beside its final destination."""
+    destination = os.path.abspath(os.fspath(path))
+    directory = os.path.dirname(destination)
+    fd, temp_path = tempfile.mkstemp(
+        prefix=f".{os.path.basename(destination)}.",
+        suffix=".tmp",
+        dir=directory,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except Exception:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        raise
+    return destination, temp_path
+
+
+def _replace_outputs_transactionally(outputs, obsolete_paths=()):
+    """Replace a complete output set, then remove obsolete target artifacts.
+
+    Every payload is built and staged before any destination is touched.
+    Existing affected files are backed up so an I/O failure during the commit
+    can restore the preceding valid output set.
+    """
+    normalized_outputs = {
+        os.path.abspath(os.fspath(path)): content
+        for path, content in outputs.items()
+    }
+    obsolete = {
+        os.path.abspath(os.fspath(path))
+        for path in obsolete_paths
+    } - set(normalized_outputs)
+    affected = sorted(set(normalized_outputs) | obsolete)
+    staged = {}
+    backups = {}
+    existed = {}
+    mutations_started = False
+    try:
+        for path, content in normalized_outputs.items():
+            destination, temp_path = _stage_text_output(path, content)
+            staged[destination] = temp_path
+
+        for path in affected:
+            existed[path] = os.path.isfile(path)
+            if existed[path]:
+                fd, backup_path = tempfile.mkstemp(
+                    prefix=f".{os.path.basename(path)}.",
+                    suffix=".bak",
+                    dir=os.path.dirname(path),
+                )
+                os.close(fd)
+                shutil.copy2(path, backup_path)
+                backups[path] = backup_path
+
+        mutations_started = True
+        for path, temp_path in staged.items():
+            os.replace(temp_path, path)
+        for path in obsolete:
+            if os.path.isfile(path):
+                os.remove(path)
+    except Exception:
+        if mutations_started:
+            for path in affected:
+                try:
+                    if existed.get(path):
+                        backup_path = backups.pop(path, None)
+                        if backup_path:
+                            os.replace(backup_path, path)
+                    elif os.path.isfile(path):
+                        os.remove(path)
+                except OSError:
+                    # Preserve the original exception; any rollback failure is
+                    # still visible through the surviving backup/temp file.
+                    pass
+        raise
+    finally:
+        for temp_path in list(staged.values()) + list(backups.values()):
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+
+
+def _json_output(value):
+    return json.dumps(value, indent=2) + "\n"
 
 
 def main():
@@ -1316,7 +1455,6 @@ def main():
     args = ap.parse_args()
     if args.report_schema_version < 1:
         ap.error("--report-schema-version must be a positive integer")
-    _remove_stale_target_outputs(args.out_prefix)
 
     with open(args.bundle) as fh:
         bundle = json.load(fh)
@@ -1346,31 +1484,32 @@ def main():
         )
     parity = build_parity_keys(bundle)
 
-    with open(f"{args.out_prefix}_dm_spec.json", "w") as fh:
-        json.dump(dm_spec, fh, indent=2)
-    written = [f"{args.out_prefix}_dm_spec.json"]
+    target_paths = {
+        suffix: f"{args.out_prefix}{suffix}"
+        for suffix in _TARGET_OUTPUT_SUFFIXES
+    }
+    dm_path = f"{args.out_prefix}_dm_spec.json"
+    outputs = {dm_path: _json_output(dm_spec)}
+    written = [dm_path]
     if wb_spec is not None:
-        path = f"{args.out_prefix}_workbook_spec.json"
-        with open(path, "w") as fh:
-            json.dump(wb_spec, fh, indent=2)
+        path = target_paths["_workbook_spec.json"]
+        outputs[path] = _json_output(wb_spec)
         written.append(path)
     if report_spec is not None:
-        path = f"{args.out_prefix}_report_spec.json"
-        with open(path, "w") as fh:
-            json.dump(report_spec, fh, indent=2)
+        path = target_paths["_report_spec.json"]
+        outputs[path] = _json_output(report_spec)
         written.append(path)
     if args.target == "auto":
-        path = f"{args.out_prefix}_target_resolution.json"
-        with open(path, "w") as fh:
-            json.dump({
-                "requestedTarget": args.target,
-                "reports": decisions,
-            }, fh, indent=2)
+        path = target_paths["_target_resolution.json"]
+        outputs[path] = _json_output({
+            "requestedTarget": args.target,
+            "reports": decisions,
+        })
         written.append(path)
-    with open("parity_keys.json", "w") as fh:
-        json.dump(parity, fh, indent=2)
-    with open("conversion_report.md", "w") as fh:
-        fh.write(flags.report_md())
+    outputs["parity_keys.json"] = _json_output(parity)
+    outputs["conversion_report.md"] = flags.report_md()
+    obsolete_paths = set(target_paths.values()) - set(outputs)
+    _replace_outputs_transactionally(outputs, obsolete_paths)
 
     summary = [f"DM elements: {len(dm_spec['pages'][0]['elements'])}"]
     if wb_spec:

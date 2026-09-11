@@ -39,23 +39,26 @@ expectation, not a promise.
 
 | SSRS parameter | Sigma control | Difficulty |
 |---|---|---|
-| Single value, String | `list` (`selectionMode: single`) | clean |
+| Single value, String with a safe valid-values source | `list` (`selectionMode: single`) | clean |
 | Single value, DateTime | `date-range` (SSRS date params are typically BETWEEN pairs) | clean |
 | Single value, Integer/Float | `number` | clean |
 | Boolean | `checkbox` | clean |
 | Multi-value (`MultiValue=true`) | `list` (`selectionMode: multiple`) | clean (filter wiring manual) |
 | Valid values from a dataset query | `list` with a value-list `source` on a DM column | medium — flagged |
+| Static valid values | omitted until a current literal-source shape is proven | medium — flagged |
 | Default = expression (`=Today()`) | set control default by hand | medium — flagged |
 
 > **Control field names are the current workbooks-as-code shape.** A `list`
 > control carries flat `mode` / `selectionMode` / `values` (NOT the removed
 > `multiSelect` / `defaultValue`); its value-list `source` and the `filters`
 > binding are independent. The converter wires a value-list source only when a
-> parsed query names the same dataset as the converted primary source and its
-> value field exactly matches a base column, or when static values have an
-> exact same-name base column. A declared lookup dataset is never rebound to an
-> unrelated primary source; otherwise the control is flagged and omitted.
-> Target `filters`
+> parsed query names a converted dataset context and its value field exactly
+> matches a base column. This may be the visual dataset or a separately declared
+> lookup dataset; it is never rebound to an unrelated primary source. Static
+> valid values are flagged and omitted because the current literal-source shape
+> has not been proven; mapping them to a same-name data column would expose
+> unrestricted values. Missing datasets/fields are likewise flagged and
+> omitted. Target `filters`
 > remain flagged because they depend on resolving dataset SQL / `@parameter`.
 > The converter does not fake a column binding — flag, never fake.
 

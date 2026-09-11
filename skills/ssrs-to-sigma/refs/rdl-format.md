@@ -174,7 +174,8 @@ parameters[]    name, dataType, multiValue, nullable, prompt,
                 defaultValues[], validValuesQuery{dataSet,valueField,labelField},
                 validValuesStatic[]
 bodyItems[]     tablix | chart | gauge | map | subreport | textbox
-                (concatenated across every <ReportSection> for 2016+ RDL)
+                (Tablix/Chart retain dataSetName; concatenated across every
+                <ReportSection> for 2016+ RDL)
 pageHeaderItems[]
 pageFooterItems[]
 layout {
@@ -191,6 +192,12 @@ layout {
 warnings[]      present ONLY when a structural miss is suspected (layout found
                 but zero visuals parsed while datasets/parameters exist)
 ```
+
+The converter treats `bodyItems[].dataSetName` as authoritative. It creates a
+base/source context for every dataset with converted SQL and binds each Tablix
+or Chart only to the matching context. If the field is absent in a
+multi-dataset report, or names a dataset that could not be converted, the item
+is flagged and omitted rather than attached to an arbitrary primary dataset.
 
 `fixtures/expected_bundle.json` is a real parse of `fixtures/SalesByRegion.rdl`
 (flat 2008/2010 layout) and `fixtures/expected_reportsections_bundle.json` is a
