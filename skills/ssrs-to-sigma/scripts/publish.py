@@ -8,206 +8,67 @@ The default operation is the non-persistent ``/spec/verify`` call. Pass
 from __future__ import annotations
 
 import argparse
-import base64
 import json
 import os
 import re
-import shlex
-import ssl
 import sys
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE / "lib"))
 import code_rep  # noqa: E402
+import sigma_rest  # noqa: E402
+
+RejectRedirectHandler = sigma_rest.RejectRedirectHandler
 
 
 class PublishError(RuntimeError):
     pass
 
 
-class RejectRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Never forward Basic or bearer credentials through an HTTP redirect."""
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        raise urllib.error.HTTPError(
-            req.full_url,
-            code,
-            f"redirect refused ({req.full_url} -> {newurl})",
-            headers,
-            fp,
-        )
-
-
 def load_neutral_env(env=None, path=None):
-    """Fill missing Sigma variables from the agent-neutral env file."""
+    """Backward-compatible entry point for the shared credential bootstrap."""
     result = dict(os.environ if env is None else env)
-    env_path = Path(path or Path.home() / ".sigma-migration" / "env")
-    if not env_path.is_file():
-        return result
-    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith("export "):
-            line = line[7:].strip()
-        if "=" not in line:
-            continue
-        key, raw_value = line.split("=", 1)
-        key = key.strip()
-        if not re.fullmatch(r"SIGMA_[A-Z0-9_]+", key) or key in result:
-            continue
-        try:
-            values = shlex.split(raw_value, posix=True)
-        except ValueError as exc:
-            raise PublishError(f"{env_path}: invalid shell quoting for {key}") from exc
-        if len(values) != 1:
-            raise PublishError(f"{env_path}: {key} must contain one literal value")
-        result[key] = values[0]
+    sigma_rest._load_neutral_env(result, str(path) if path else None)
     return result
 
 
 def validate_base_url(value, allow_insecure=False):
-    """Validate and normalize a Sigma API origin before sending credentials."""
-    if not value:
-        raise PublishError("Set SIGMA_BASE_URL")
-    parsed = urllib.parse.urlsplit(value)
-    host = (parsed.hostname or "").lower()
-    if parsed.username or parsed.password or parsed.query or parsed.fragment:
-        raise PublishError("SIGMA_BASE_URL must be an API origin without credentials/query")
-    if parsed.path not in ("", "/"):
-        raise PublishError("SIGMA_BASE_URL must not include an API path")
-    trusted = host == "sigmacomputing.com" or host.endswith(".sigmacomputing.com")
-    if not allow_insecure and (parsed.scheme != "https" or not trusted):
-        raise PublishError(
-            "SIGMA_BASE_URL must use https:// on a sigmacomputing.com host; "
-            "set SIGMA_ALLOW_INSECURE_BASE_URL=1 only for controlled dev/test"
-        )
-    if not host or not parsed.scheme:
-        raise PublishError("SIGMA_BASE_URL must be an absolute URL")
-    return urllib.parse.urlunsplit(
-        (parsed.scheme, parsed.netloc, "", "", "")
-    ).rstrip("/")
+    """Backward-compatible wrapper around the vendored REST security check."""
+    try:
+        return sigma_rest.validate_base_url(value, allow_insecure)
+    except sigma_rest.SigmaError as exc:
+        raise PublishError(str(exc)) from exc
 
 
 class SigmaClient:
-    def __init__(self, env=None, opener=None):
-        self.env = load_neutral_env(env)
-        self.base_url = validate_base_url(
-            self.env.get("SIGMA_BASE_URL"),
-            self.env.get("SIGMA_ALLOW_INSECURE_BASE_URL") == "1",
-        )
-        self.opener = opener or urllib.request.build_opener(
-            urllib.request.HTTPSHandler(context=ssl.create_default_context()),
-            RejectRedirectHandler(),
-        )
-        self.token = self.env.get("SIGMA_API_TOKEN")
-        if not self.token:
-            self.token = self._mint_token()
-
-    def _open(self, request, retry_statuses=()):
-        open_request = (
-            self.opener.open
-            if hasattr(self.opener, "open")
-            else self.opener
-        )
-        try:
-            return open_request(request, timeout=60)
-        except TypeError:
-            # Small fake openers used by tests need not mirror urlopen's kwargs.
-            return open_request(request)
-        except urllib.error.HTTPError as exc:
-            if exc.code in retry_statuses:
-                exc.close()
-                return None
-            detail = exc.read().decode("utf-8", "replace")
-            raise PublishError(
-                f"{request.method} {request.full_url} returned HTTP {exc.code}: "
-                f"{detail[:1000]}"
-            ) from exc
-        except urllib.error.URLError as exc:
-            raise PublishError(
-                f"{request.method} {request.full_url} failed: {exc.reason}"
-            ) from exc
-
-    def _mint_token(self):
-        client_id = self.env.get("SIGMA_CLIENT_ID")
-        secret = self.env.get("SIGMA_CLIENT_SECRET")
-        if not client_id or not secret:
-            raise PublishError(
-                "Set SIGMA_API_TOKEN or SIGMA_CLIENT_ID and SIGMA_CLIENT_SECRET"
-            )
-        if client_id == secret:
-            raise PublishError(
-                "SIGMA_CLIENT_SECRET is identical to SIGMA_CLIENT_ID"
-            )
-        basic = base64.b64encode(
-            f"{client_id}:{secret}".encode("utf-8")
-        ).decode("ascii")
-        request = urllib.request.Request(
-            self.base_url + "/v2/auth/token",
-            data=urllib.parse.urlencode(
-                {"grant_type": "client_credentials"}
-            ).encode("ascii"),
-            method="POST",
-            headers={
-                "Authorization": f"Basic {basic}",
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Accept": "application/json",
-            },
-        )
-        with self._open(request) as response:
-            try:
-                payload = json.loads(response.read())
-            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-                raise PublishError("token response was not valid JSON") from exc
-        token = payload.get("access_token") if isinstance(payload, dict) else None
-        if not token:
-            raise PublishError("token response did not contain access_token")
-        return token
-
-    def _request(self, method, path, body=None, accept="application/json",
-                 retry_statuses=()):
-        data = None if body is None else json.dumps(body).encode("utf-8")
-        headers = {
-            "Authorization": f"Bearer {self.token}",
-            "Accept": accept,
-        }
-        if data is not None:
-            headers["Content-Type"] = "application/json"
-        request = urllib.request.Request(
-            self.base_url + path, data=data, method=method.upper(), headers=headers
-        )
-        return self._open(request, retry_statuses=retry_statuses)
+    """SSRS publishing facade over the vendored age-aware REST runtime."""
 
     def request_json(self, method, path, body=None):
-        with self._request(method, path, body) as response:
-            raw = response.read()
-        if not raw:
-            return {}
         try:
-            value = json.loads(raw)
-        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-            raise PublishError(f"{method} {path} returned non-JSON content") from exc
+            value = sigma_rest.request(method, path, body=body)
+        except sigma_rest.SigmaError as exc:
+            raise PublishError(str(exc)) from exc
+        if value is None:
+            return {}
         if not isinstance(value, dict):
             raise PublishError(f"{method} {path} returned a non-object JSON value")
         return value
 
     def request_bytes(self, method, path, body=None, accept="*/*"):
-        response = self._request(
-            method, path, body, accept, retry_statuses=(404,)
-        )
-        if response is None:
-            return None
-        with response:
-            if getattr(response, "status", 200) == 204:
-                return None
-            return response.read()
+        try:
+            return sigma_rest.request(
+                method,
+                path,
+                body=body,
+                accept=accept,
+                binary=True,
+                allow_statuses=(404,),
+            )
+        except sigma_rest.SigmaError as exc:
+            raise PublishError(str(exc)) from exc
 
 
 def load_spec(path):

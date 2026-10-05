@@ -47,9 +47,8 @@ layout behavior) — never emit confidently-wrong logic.
 
 - **The RDL.** Either the customer's `ssrs-export-*.zip` (Phase 0), a folder of
   `.rdl`/`.rdlc` files, or an SSDT `.rptproj` project folder.
-- **Sigma API token** — `eval "$(scripts/get-token.sh)"` (uses
-  `SIGMA_CLIENT_ID` / `SIGMA_CLIENT_SECRET` / `SIGMA_BASE_URL`, or
-  `~/.sigma-migration/env`).
+- **Sigma authentication** — set `SIGMA_BASE_URL`, then use browser OAuth
+  (preferred) or client credentials as described below.
 - **A Sigma connection to the same warehouse SSRS queried.** Parity only means
   something when Sigma reads the database the SSRS reports read. You'll need the
   connection id, target database, and a destination folder id.
@@ -60,6 +59,37 @@ layout behavior) — never emit confidently-wrong logic.
 - **Private-beta access:** Workbooks as Code and Reports as Code are
   entitlement-gated. Report creation also requires **Create, edit, and publish
   reports** permission. A valid API token does not imply either entitlement.
+
+### Sigma authentication (browser-first)
+
+For an interactive terminal, sign in once through the browser. The refresh
+token is stored only in macOS Keychain or Linux libsecret:
+
+```bash
+export SIGMA_BASE_URL="https://api.sigmacomputing.com"
+eval "$(scripts/browser-login.sh)"
+```
+
+For later sessions, `eval "$(scripts/get-token.sh)"` uses
+`SIGMA_AUTH_MODE=auto`: browser keychain cache/refresh first, then
+`SIGMA_CLIENT_ID` / `SIGMA_CLIENT_SECRET` from the environment or
+`~/.sigma-migration/env`. Set the mode to `browser` or `client-credentials` to
+require one provider. Unattended systems can use client credentials directly.
+
+`publish.py` and `verify_parity.py` share the same vendored REST runtime. They
+honor a valid environment bearer first, then `auth.json` in `SIGMA_WORKDIR` or
+the current directory, then invoke the dual provider. Known token ages refresh
+proactively after 50 minutes; an API 401 triggers exactly one refresh and one
+retry. All bearer requests reject redirects, and credentials are sent only to
+a validated Sigma API origin. To create a shell-neutral access-token handoff:
+
+```bash
+python3 scripts/get_token.py --workdir <WORKDIR>
+export SIGMA_WORKDIR=<WORKDIR>
+```
+
+`auth.json` is mode 0600 where supported and contains no refresh token. Never
+commit it.
 
 ## Phase 0 — Export the RDL (customer, inside the firewall)
 
@@ -230,11 +260,11 @@ python3 scripts/publish.py --spec sigma_report_spec.json \
   --out-dir publish/report --create --pdf-out publish/report/render.pdf
 ```
 
-`publish.py` uses only the stdlib, loads credentials from the environment or
-`~/.sigma-migration/env`, rejects unsafe API origins, saves verify/create
-responses and readback, and checks element/layout coverage where parseable.
-Basic and bearer requests reject redirects so credentials cannot cross origins;
-report PDF polling treats bounded 404/204/processing responses as not-ready.
+`publish.py` uses only the stdlib and the browser-first authentication chain
+above, rejects unsafe API origins, saves verify/create responses and readback,
+and checks element/layout coverage where parseable. Bearer requests reject
+redirects so credentials cannot cross origins; report PDF polling treats
+bounded 404/204/processing responses as not-ready.
 Workbook/report GET readback requests JSON explicitly (`?format=json`) and the
 gate compares the complete normalized document; material source, column,
 formula, filter, panel, or layout changes fail. Only response-envelope metadata

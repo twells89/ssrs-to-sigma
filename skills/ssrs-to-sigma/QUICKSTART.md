@@ -58,12 +58,20 @@ hidden dependency pages); the converter does not partition oversized output.
 
 1. **Phase 0** — customer runs `scripts/export-ssrs.ps1` inside the firewall →
    `ssrs-export-*.zip`.
-2. Set credentials:
+2. Authenticate. Browser OAuth is preferred for an interactive terminal:
    ```bash
    export SIGMA_BASE_URL="https://api.sigmacomputing.com"
-   export SIGMA_CLIENT_ID="..." SIGMA_CLIENT_SECRET="..."   # or ~/.sigma-migration/env
+   eval "$(scripts/browser-login.sh)"  # one-time; refresh token stays in the OS keychain
    eval "$(scripts/get-token.sh)"
    ```
+   Later `get-token.sh` reuses or refreshes that browser session. In its
+   default `auto` mode it falls back to `SIGMA_CLIENT_ID` /
+   `SIGMA_CLIENT_SECRET` (or `~/.sigma-migration/env`) when browser auth is
+   unavailable. Set `SIGMA_AUTH_MODE=browser` or `client-credentials` to
+   require one path. A shell-neutral handoff is also supported:
+   `python3 scripts/get_token.py --workdir <WORKDIR>` followed by
+   `export SIGMA_WORKDIR=<WORKDIR>`; `auth.json` contains an access token only
+   and must remain private.
 3. Install/load companion `sigma-authoring` (`sigma-data-models` and
    `sigma-workbooks`); load `sigma-reports` for report output.
 4. Walk Phases 1 → 6 in `SKILL.md`: reuse-check first; DM POST/readback;
@@ -87,7 +95,9 @@ python3 scripts/publish.py --spec /tmp/sigma_report_spec.json \
 
 The helper saves verify/create responses and JSON readback, and compares the
 complete normalized document (including sources, columns, formulas, filters,
-panels, and layout). A PASS is structural only; it is not live parity proof.
+panels, and layout). It reuses a valid environment bearer or `auth.json`,
+refreshes a known-stale token proactively, and refreshes/retries once on 401.
+A PASS is structural only; it is not live parity proof.
 
 ## Regression check after editing the parser or converter
 
