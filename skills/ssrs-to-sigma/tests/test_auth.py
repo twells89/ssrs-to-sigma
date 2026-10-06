@@ -32,6 +32,26 @@ PROVIDER = {
 
 
 class ProviderContractTest(unittest.TestCase):
+    def test_token_exchange_refuses_redirects(self):
+        response = io.BytesIO(b'{"access_token":"token"}')
+        opener = mock.MagicMock()
+        opener.open.return_value.__enter__.return_value = response
+        request = urllib.request.Request(f"{BASE}/v2/auth/token")
+
+        with mock.patch.object(
+            urllib.request, "build_opener", return_value=opener
+        ) as build_opener, mock.patch.object(
+            urllib.request, "urlopen"
+        ) as urlopen:
+            payload = get_token._json_response(request, "token exchange failed")
+
+        self.assertEqual({"access_token": "token"}, payload)
+        self.assertIsInstance(
+            build_opener.call_args.args[0], get_token._RejectRedirects
+        )
+        opener.open.assert_called_once_with(request, timeout=30)
+        urlopen.assert_not_called()
+
     def test_browser_mode_uses_keychain_cache_without_client_credentials(self):
         keychain = {
             "refresh-token": "refresh-token",
@@ -62,6 +82,36 @@ class ProviderContractTest(unittest.TestCase):
         self.assertEqual("browser", result.auth_method)
         self.assertEqual(MINTED, result.minted_at)
         client.assert_not_called()
+
+    def test_stale_browser_cache_is_refreshed(self):
+        now = 4_000
+        keychain = {
+            "refresh-token": "refresh-token",
+            "access-token": "stale-token",
+            "access-expiry": "5000",
+            "access-minted-at": get_token._iso_z(
+                now - get_token._ACCESS_CACHE_TTL_SECONDS - 1
+            ),
+            "client-id": "client-id",
+            "token-url": f"{BASE}/v2/auth/token",
+        }
+        with mock.patch.object(
+            get_token, "_keychain_backend", return_value="libsecret"
+        ), mock.patch.object(
+            get_token,
+            "_kc_get",
+            side_effect=lambda _backend, key: keychain.get(key, ""),
+        ), mock.patch.object(
+            get_token,
+            "_json_response",
+            return_value={"access_token": "fresh-token", "expires_in": 3600},
+        ) as exchange, mock.patch.object(
+            get_token, "_cache_access_token"
+        ):
+            result = get_token._mint_browser_refresh(BASE, now=now)
+
+        self.assertEqual("fresh-token", result.token)
+        exchange.assert_called_once()
 
     def test_auto_falls_back_to_client_credentials(self):
         expected = get_token.TokenResult(
@@ -237,6 +287,19 @@ class RestAuthenticationContractTest(unittest.TestCase):
         self.assertEqual(302, raised.exception.code)
         self.assertIn("redirect refused", str(raised.exception))
         self.assertNotIn("secret-token", str(raised.exception))
+
+    def test_http_opener_honors_environment_proxies(self):
+        with mock.patch.dict(
+            os.environ, {"HTTPS_PROXY": "http://proxy.example:8080"}
+        ):
+            opener = sigma_rest._http_opener()
+
+        self.assertTrue(
+            any(
+                isinstance(handler, urllib.request.ProxyHandler)
+                for handler in opener.handlers
+            )
+        )
 
 
 if __name__ == "__main__":

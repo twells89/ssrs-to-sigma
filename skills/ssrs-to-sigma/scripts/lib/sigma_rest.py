@@ -382,6 +382,7 @@ def _http_opener():
     """Build an HTTP(S)-only opener that refuses every redirect."""
     opener = urllib.request.OpenerDirector()
     for handler in (
+        urllib.request.ProxyHandler(),
         urllib.request.HTTPSHandler(context=_ssl_context()),
         urllib.request.HTTPHandler(),
         urllib.request.HTTPDefaultErrorHandler(),

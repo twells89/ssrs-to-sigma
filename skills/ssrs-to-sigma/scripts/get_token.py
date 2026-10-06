@@ -60,6 +60,7 @@ PUBLISHED_API_HOSTS = frozenset(
 AUTH_MODES = ("auto", "browser", "client-credentials")
 _BEARER_RE = re.compile(r"^[A-Za-z0-9._~+/=-]+$")
 _MINTED_AT_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+_ACCESS_CACHE_TTL_SECONDS = 50 * 60
 _NEUTRAL_ENV = os.path.expanduser("~/.sigma-migration/env")
 _NEUTRAL_KEYS = frozenset(
     ("SIGMA_BASE_URL", "SIGMA_CLIENT_ID", "SIGMA_CLIENT_SECRET", "SIGMA_AUTH_MODE")
@@ -136,7 +137,12 @@ def _iso_z(timestamp=None):
 
 def _validate_minted_at(value, fallback_timestamp):
     if value and _MINTED_AT_RE.fullmatch(value):
-        return value
+        try:
+            datetime.datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+        except ValueError:
+            pass
+        else:
+            return value
     return _iso_z(fallback_timestamp)
 
 
@@ -187,8 +193,9 @@ def _assert_sigma_url(url, label="OAuth endpoint", base_url=False):
 
 
 def _json_response(req, failure_prefix):
+    opener = urllib.request.build_opener(_RejectRedirects())
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with opener.open(req, timeout=30) as resp:
             return json.load(resp)
     except urllib.error.HTTPError as exc:
         raise TokenProviderError(
@@ -386,11 +393,19 @@ def _mint_browser_refresh(base, now=None):
     now_epoch = int(now_value)
     cached = _kc_get(backend, "access-token")
     expiry = _kc_get(backend, "access-expiry")
-    if cached and expiry.isdigit() and int(expiry) > now_epoch:
+    minted_at = _validate_minted_at(
+        _kc_get(backend, "access-minted-at"), now_value
+    )
+    minted_epoch = datetime.datetime.strptime(
+        minted_at, "%Y-%m-%dT%H:%M:%SZ"
+    ).replace(tzinfo=datetime.timezone.utc).timestamp()
+    if (
+        cached
+        and expiry.isdigit()
+        and int(expiry) > now_epoch
+        and now_value - minted_epoch <= _ACCESS_CACHE_TTL_SECONDS
+    ):
         token = _validate_access_token(cached)
-        minted_at = _validate_minted_at(
-            _kc_get(backend, "access-minted-at"), now_value
-        )
         return TokenResult(base, token, minted_at, "browser")
 
     client_id = _kc_get(backend, "client-id")
@@ -439,7 +454,9 @@ def _mint_browser_refresh(base, now=None):
         expires_in = int(payload.get("expires_in") or 3600)
     except (TypeError, ValueError):
         expires_in = 3600
-    cache_expiry = now_epoch + max(0, expires_in - 60)
+    cache_expiry = now_epoch + min(
+        _ACCESS_CACHE_TTL_SECONDS, max(0, expires_in - 60)
+    )
 
     # Rotating refresh tokens may be single-use. Persist the replacement before
     # returning the access token; silently keeping the spent token would make
