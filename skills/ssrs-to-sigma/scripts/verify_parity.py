@@ -19,35 +19,36 @@ on the key columns, and compares values (money/counts exact to a cent; ratio
 metrics within rel-tol 1e-6). GREEN only when every element PASSes — a 200 on
 the workbook POST is NOT parity.
 
-Requires: SIGMA_API_TOKEN + SIGMA_BASE_URL in the env (eval get-token.sh first).
-stdlib only.
+Authentication is browser-first with client-credentials fallback. A valid
+environment bearer or ``auth.json`` is reused; known-stale tokens refresh
+proactively and a 401 refreshes and retries once. Stdlib only.
 """
 import argparse
 import csv
 import io
 import json
-import os
 import sys
 import time
-import urllib.request
-import urllib.error
+from pathlib import Path
 
-BASE = os.environ.get("SIGMA_BASE_URL", "https://api.sigmacomputing.com")
-TOKEN = os.environ.get("SIGMA_API_TOKEN")
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE / "lib"))
+import sigma_rest  # noqa: E402
+
 REL_TOL = 1e-6
 ABS_TOL = 0.005   # half a cent
 
 
 def _req(method, path, body=None, raw=False):
-    url = path if path.startswith("http") else f"{BASE}{path}"
-    data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(url, data=data, method=method)
-    req.add_header("Authorization", f"Bearer {TOKEN}")
-    if body is not None:
-        req.add_header("Content-Type", "application/json")
-    with urllib.request.urlopen(req) as r:
-        payload = r.read()
-    return payload if raw else json.loads(payload or b"{}")
+    value = sigma_rest.request(
+        method,
+        path,
+        body=body,
+        accept="text/csv" if raw else "application/json",
+        binary=raw,
+        allow_statuses=(404, 409, 425) if raw else (),
+    )
+    return ({} if value is None else value) if not raw else value
 
 
 def export_element_csv(workbook_id, element_id, page_id=None):
@@ -61,14 +62,11 @@ def export_element_csv(workbook_id, element_id, page_id=None):
         raise RuntimeError(f"export start returned no query id: {started}")
     for _ in range(60):
         time.sleep(2)
-        try:
-            data = _req("GET", f"/v2/query/{query_id}/download", raw=True)
-            text = data.decode("utf-8", "replace")
-            return list(csv.DictReader(io.StringIO(text)))
-        except urllib.error.HTTPError as e:
-            if e.code in (404, 409, 425):   # not ready yet
-                continue
-            raise
+        data = _req("GET", f"/v2/query/{query_id}/download", raw=True)
+        if data is None:
+            continue
+        text = data.decode("utf-8", "replace")
+        return list(csv.DictReader(io.StringIO(text)))
     raise TimeoutError(f"export {query_id} did not finish")
 
 
@@ -123,10 +121,6 @@ def main():
                     help='JSON {"<report>/<element>": {"elementId": "...", "pageId": "..."}}')
     ap.add_argument("--report", default="parity_report.md")
     args = ap.parse_args()
-
-    if not TOKEN:
-        print("SIGMA_API_TOKEN not set — run: eval \"$(scripts/get-token.sh)\"", file=sys.stderr)
-        sys.exit(2)
 
     with open(args.expected) as fh:
         expected = json.load(fh)

@@ -20,6 +20,7 @@ import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SKILL = os.path.dirname(HERE)
@@ -1170,18 +1171,23 @@ class PublishHelperTest(unittest.TestCase):
         self.assertEqual(sleeps, [0.25])
 
     def test_download_404_is_treated_as_bounded_not_ready(self):
-        def not_ready(request, timeout=None):
-            raise urllib.error.HTTPError(
-                request.full_url, 404, "not ready", {}, io.BytesIO(b"")
-            )
-
-        client = publish.SigmaClient(env={
+        env = {
             "SIGMA_BASE_URL": "https://api.sigmacomputing.com",
             "SIGMA_API_TOKEN": "token",
-        }, opener=not_ready)
-        self.assertIsNone(client.request_bytes(
-            "GET", "/v2/query/query-1/download"
-        ))
+        }
+        with mock.patch.dict(os.environ, env, clear=True), \
+             mock.patch.object(
+                 publish.sigma_rest,
+                 "_send",
+                 return_value=publish.sigma_rest._Resp(404, b"", "not ready"),
+             ):
+            publish.sigma_rest.reset_runtime_state()
+            self.assertIsNone(
+                publish.SigmaClient().request_bytes(
+                    "GET", "/v2/query/query-1/download"
+                )
+            )
+        publish.sigma_rest.reset_runtime_state()
 
     def test_redirects_never_forward_basic_or_bearer_authorization(self):
         handler = publish.RejectRedirectHandler()

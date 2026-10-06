@@ -68,6 +68,27 @@ python3 skills/ssrs-assessment/scripts/assess.py --dir ssrs-export/reports --out
 Or install as a Claude Code plugin and just ask: *"migrate my SSRS reports to
 Sigma"* / *"assess my SSRS estate."*
 
+## Sigma authentication
+
+Interactive terminal work prefers browser OAuth. Set your published Sigma API
+host, run the browser flow once, then let the dual provider reuse/refresh the
+OS-keychain session:
+
+```bash
+export SIGMA_BASE_URL="https://api.sigmacomputing.com"
+eval "$(skills/ssrs-to-sigma/scripts/browser-login.sh)"  # one-time sign-in
+eval "$(skills/ssrs-to-sigma/scripts/get-token.sh)"      # later sessions
+```
+
+`get-token.sh` defaults to `SIGMA_AUTH_MODE=auto`: browser keychain first, then
+`SIGMA_CLIENT_ID` / `SIGMA_CLIENT_SECRET` (including
+`~/.sigma-migration/env`) for unattended hosts. Use `browser` or
+`client-credentials` to require one path. `publish.py` and `verify_parity.py`
+also accept a valid environment bearer or `auth.json`, refresh tokens with
+known age before expiry, and refresh/retry exactly once on a 401. Browser
+refresh tokens stay in macOS Keychain or Linux libsecret and are never written
+to the workspace.
+
 Load the companion `sigma-authoring` skills (`sigma-data-models` and
 `sigma-workbooks`), plus `sigma-reports` for report output. Both code-rep
 resource families are private beta; reports also require **Create, edit, and

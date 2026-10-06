@@ -3,6 +3,9 @@ __pycache__/
 .DS_Store
 .token
 .sigma_env
+# OAuth access-token handoff and temporary browser callback (never commit).
+auth.json
+.sigma-oauth-callback*
 exports/
 ssrs-export-*/
 samples/
