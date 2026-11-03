@@ -184,10 +184,10 @@ re-implementing:
   fields and role grants separately, preserve warehouse/Sigma CLS, and test
   representative allowed and denied identities after DM readback.
 
-`publish.py` defaults to `/spec/verify`; `--create` is the explicit persistent
+`publish.py` defaults to a `dryRun: true` POST (the old `/spec/verify` is deprecated); `--create` is the explicit persistent
 write boundary. Workbooks as Code and Reports as Code are private beta, reports
 require **Create, edit, and publish reports** permission, and reports currently
-have no DELETE endpoint. GET readback requests JSON explicitly and compares the
+have no DELETE endpoint. GET readback (`?includeContents=true`) compares the
 complete normalized submitted/current document; only response-envelope
 metadata and benign layout XML whitespace are ignored. Saved verify/create/
 readback files and optional PDF are evidence inputs only. This repository has

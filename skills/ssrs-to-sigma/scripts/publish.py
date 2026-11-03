@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Verify, or explicitly create and read back, a Sigma workbook/report spec.
 
-The default operation is the non-persistent ``/spec/verify`` call. Pass
+The default operation is the non-persistent dry run (``POST /v2/<kind>s`` with
+``dryRun: true``; the old ``/spec/verify`` endpoint is deprecated). Pass
 ``--create`` to opt into a persistent POST. Stdlib only.
 """
 
@@ -57,6 +58,29 @@ class SigmaClient:
             raise PublishError(f"{method} {path} returned a non-object JSON value")
         return value
 
+    def dry_run(self, path, body):
+        """POST a dry-run body; return code_rep.dry_run_result's normalized dict.
+
+        Success is HTTP 200 (no ``valid`` key); schema failures are HTTP 400
+        with ``valid: false`` and ``errors``, so 4xx bodies are parsed, not raised.
+        """
+        try:
+            value = sigma_rest.request("POST", path, body=body)
+        except sigma_rest.SigmaHttpError as exc:
+            if 400 <= exc.status < 500:
+                try:
+                    parsed = json.loads(exc.body.decode("utf-8", "replace"))
+                except ValueError:
+                    parsed = {}
+                return code_rep.dry_run_result(exc.status, parsed)
+            raise PublishError(str(exc)) from exc
+        except sigma_rest.SigmaError as exc:
+            raise PublishError(str(exc)) from exc
+        value = value if isinstance(value, dict) else {}
+        if value.get("workbookId") or value.get("reportId"):
+            raise PublishError("dry run unexpectedly created an object")
+        return code_rep.dry_run_result(200, value)
+
     def request_bytes(self, method, path, body=None, accept="*/*"):
         try:
             return sigma_rest.request(
@@ -82,7 +106,9 @@ def load_spec(path):
 
 
 def detect_kind(spec, requested="auto"):
-    document = spec.get("document")
+    document = spec.get("contents")
+    if not isinstance(document, dict):
+        document = spec.get("document")
     kind = document.get("kind") if isinstance(document, dict) else None
     if requested != "auto":
         if kind and kind != requested:
@@ -96,9 +122,13 @@ def detect_kind(spec, requested="auto"):
 
 
 def _document(spec, kind):
-    return code_rep.document(spec) if kind == "workbook" else (
-        spec.get("document") or {}
-    )
+    if kind == "workbook":
+        return code_rep.document(spec)
+    # report contents are a different representation: no flat fallback
+    inner = spec.get("contents")
+    if not isinstance(inner, dict):
+        inner = spec.get("document")
+    return inner if isinstance(inner, dict) else {}
 
 
 def _id_set(items):
@@ -325,18 +355,19 @@ def publish_spec(kind, spec, client, out_dir, create=False, pdf_out=None,
             "PDF polling requires --poll-attempts >= 1 and "
             "--poll-interval >= 0"
         )
-    base = f"/v2/{kind}s"
-    verify = client.request_json("POST", f"{base}/spec/verify", spec)
+    base = code_rep.create_path(kind)
+    verify = client.dry_run(base, code_rep.create_body(spec, dry_run=True, type_=kind))
     _write_json(out_dir / f"{kind}-verify-response.json", verify)
     result = {"kind": kind, "verify": verify, "created": False}
     if verify.get("valid") is not True:
         raise PublishError(
-            f"{kind} server verification did not return valid=true"
+            f"{kind} server verification did not return valid=true: "
+            f"{json.dumps(verify.get('errors') or [])[:500]}"
         )
     if not create:
         return result
 
-    response = client.request_json("POST", f"{base}/spec", spec)
+    response = client.request_json("POST", base, code_rep.create_body(spec, type_=kind))
     _write_json(out_dir / f"{kind}-create-response.json", response)
     id_field = f"{kind}Id"
     object_id = response.get(id_field) or response.get("id")
@@ -344,7 +375,7 @@ def publish_spec(kind, spec, client, out_dir, create=False, pdf_out=None,
         raise PublishError(f"{kind} create response contained no {id_field}")
     _write_json(out_dir / f"{kind}-{object_id}-submitted.json", spec)
     readback = client.request_json(
-        "GET", f"{base}/{object_id}/spec?format=json"
+        "GET", code_rep.read_path(object_id, kind)
     )
     _write_json(out_dir / f"{kind}-{object_id}-readback.json", readback)
     verdict = readback_verdict(spec, readback, kind)

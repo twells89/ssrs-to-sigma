@@ -43,12 +43,12 @@ source exists. Static valid-value lists are omitted with an explicit flag until
 a supported literal-source contract is proven.
 
 The offline report `schemaVersion` default is `1`. For a live workflow, GET a
-recent report spec as JSON, copy `document.schemaVersion`, and reconvert with
+recent report as JSON, copy `contents.schemaVersion`, and reconvert with
 `--report-schema-version <current>` before verify/create:
 
 ```bash
 curl -sf -H "Authorization: Bearer $SIGMA_API_TOKEN" \
-  "$SIGMA_BASE_URL/v2/reports/<reference-report-id>/spec?format=json"
+  "$SIGMA_BASE_URL/v2/reports/<reference-report-id>?includeContents=true"
 ```
 
 Local validation rejects a report with more than 1,000 total pages (including
@@ -93,7 +93,7 @@ python3 scripts/publish.py --spec /tmp/sigma_report_spec.json \
   --pdf-out /tmp/publish-report/report.pdf
 ```
 
-The helper saves verify/create responses and JSON readback, and compares the
+The helper dry-runs (`dryRun: true`), saves verify/create responses and JSON readback, and compares the
 complete normalized document (including sources, columns, formulas, filters,
 panels, and layout). It reuses a valid environment bearer or `auth.json`,
 refreshes a known-stale token proactively, and refreshes/retries once on 401.
