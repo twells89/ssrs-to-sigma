@@ -1,13 +1,31 @@
 """Shape adapter for the Sigma WORKBOOK code representation.
 
-Workbook writes nest their document fields under ``document``. Data-model
-code representations do not use this adapter.
+Wire format: the /v2/workbooks/spec and /v2/reports/spec endpoints are
+DEPRECATED (OpenAPI 2.0.0+20261030). Their replacements carry the same
+document under ``contents`` instead of ``document``: create/dry-run
+``POST /v2/workbooks``, read ``GET /v2/workbooks/{id}?includeContents=true``,
+update ``PUT /v2/workbooks/{id}/contents`` (and the same under /v2/reports).
+Build paths and bodies with the endpoint helpers below. On-disk artifacts keep
+the ``document`` wrapper that wrap() emits; create_body/update_body re-key it at
+the API boundary. Data-model code representations do not use this adapter.
 """
 
 DOC_KEYS = (
     "schemaVersion", "pages", "elements", "overlays", "panels",
     "kind", "layout", "settings", "agents",
 )
+# Envelope keys of workbook/report responses that are never writable. The
+# /spec-era name (latestDocumentVersion) stays listed so old snapshots strip the
+# same way as live readbacks. folderId is writable, so it is kept.
+RESPONSE_ONLY_KEYS = (
+    "workbookId", "workbookUrlId", "reportId", "reportUrlId", "url", "path",
+    "documentVersion", "latestVersion", "latestDocumentVersion", "ownerId",
+    "createdBy", "updatedBy", "createdAt", "updatedAt", "isArchived", "tags",
+    "taggedSourceUrlId", "warnings", "dryRun", "valid", "errors",
+)
+CREATE_METADATA_KEYS = ("name", "folderId", "description", "ownerId")
+WORKBOOKS_PATH = "/v2/workbooks"
+REPORTS_PATH = "/v2/reports"
 LEGACY_THEME_KEYS = ("themeName", "themeOverrides")
 LEGACY_HORIZONTAL_ALIGN = {"start": "left", "middle": "center", "end": "right"}
 LEGACY_VERTICAL_ALIGN = {"start": "top", "middle": "center", "end": "bottom"}
@@ -56,10 +74,13 @@ def theme(spec):
 
 
 def document(response):
-    """Return the workbook document from either the nested or legacy shape."""
+    """Return the workbook document from the ``contents`` shape, the /spec-era
+    ``document`` shape, or a legacy flat artifact."""
     if not isinstance(response, dict):
         return {}
-    inner = response.get("document")
+    inner = response.get("contents")
+    if not isinstance(inner, dict):
+        inner = response.get("document")
     doc = inner if isinstance(inner, dict) else {
         key: value for key, value in response.items() if key in DOC_KEYS
     }
@@ -71,7 +92,7 @@ def metadata(response):
         return {}
     return {
         key: value for key, value in response.items()
-        if key != "document"
+        if key not in ("document", "contents")
         and key not in DOC_KEYS
         and key not in LEGACY_THEME_KEYS
     }
@@ -241,3 +262,88 @@ def wrap(doc, extra=None):
         flattened = canonical
     out["document"] = flattened
     return out
+
+
+# ---- Endpoint helpers -----------------------------------------------------
+# ``type_`` is "workbook" or "report". Paths are relative to SIGMA_BASE_URL.
+
+def _collection_path(type_):
+    if type_ == "workbook":
+        return WORKBOOKS_PATH
+    if type_ == "report":
+        return REPORTS_PATH
+    raise ValueError(f"unknown code-rep type {type_!r} (want 'workbook' or 'report')")
+
+
+def create_path(type_="workbook"):
+    """POST target for create and for dry-run validation."""
+    return _collection_path(type_)
+
+
+def read_path(id_, type_="workbook", document_version=None):
+    """GET that returns the envelope plus ``contents`` and ``documentVersion``."""
+    path = f"{_collection_path(type_)}/{id_}?includeContents=true"
+    if document_version is not None and document_version is not False:
+        return f"{path}&documentVersion={int(document_version)}"
+    return path
+
+
+def update_path(id_, type_="workbook"):
+    """PUT target that replaces an existing document."""
+    return f"{_collection_path(type_)}/{id_}/contents"
+
+
+def _api_contents(spec, type_):
+    _collection_path(type_)  # validates type_
+    if type_ == "workbook":
+        return wrap(document(spec))["document"]
+    return document(spec)
+
+
+def create_body(spec, extra=None, dry_run=False, type_="workbook"):
+    """Create (or dry-run) body. ``spec`` may be a bare document, a ``document``-
+    or ``contents``-wrapped artifact, or a flat legacy artifact; its name /
+    folderId / description / ownerId are used unless overridden in ``extra``.
+    Workbook contents are flattened/canonicalized like wrap(); report contents
+    are a different representation and pass through untouched."""
+    meta = {k: v for k, v in metadata(spec).items() if k in CREATE_METADATA_KEYS}
+    body = {**meta, **{str(k): v for k, v in (extra or {}).items()},
+            "contents": _api_contents(spec, type_)}
+    if dry_run:
+        body["dryRun"] = True
+    return body
+
+
+def update_body(spec, document_version=None, type_="workbook"):
+    """Update body. Pass the documentVersion you read to make the PUT fail
+    with code stale_document_settings instead of overwriting newer edits."""
+    body = {"contents": _api_contents(spec, type_)}
+    if document_version is not None and document_version is not False:
+        body["documentVersion"] = document_version
+    return body
+
+
+def dry_run_result(status, body):
+    """Normalize a dry-run response to the /spec/verify-era shape callers
+    check: {"valid": bool, "errors": [{"summary": ...}], "warnings": [...]}.
+    Success is HTTP 200 with no ``valid`` key; a schema failure is HTTP 400
+    with valid:false and errors; other 4xx carry only ``message``."""
+    try:
+        status = int(status)
+    except (TypeError, ValueError):
+        status = 0
+    body = body if isinstance(body, dict) else {}
+    warnings = list(body.get("warnings") or [])
+    if 200 <= status <= 299:
+        return {"valid": True, "errors": [], "warnings": warnings}
+    errors = list(body.get("errors") or [])
+    if not errors:
+        errors = [{"summary": body.get("message") or f"HTTP {status}"}]
+    return {"valid": False, "errors": errors, "warnings": warnings}
+
+
+def strip_response_only(spec):
+    """Strip non-writable envelope keys (live and /spec-era) from a readback."""
+    if not isinstance(spec, dict):
+        return spec
+    return {k: v for k, v in spec.items() if k not in RESPONSE_ONLY_KEYS}

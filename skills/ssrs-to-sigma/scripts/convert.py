@@ -4,7 +4,7 @@ convert.py — Phase 2 of ssrs-to-sigma.
 
 Turn a `bundle.json` (from parse_rdl.py) into Sigma specs:
   - sigma_dm_spec.json        (POST /v2/dataModels/spec)
-  - sigma_workbook_spec.json  (POST /v2/workbooks/spec)
+  - sigma_workbook_spec.json  (document -> POST /v2/workbooks `contents`)
   - parity_keys.json          (Phase 5 grouping keys per report)
   - conversion_report.md      (what converted, what was flagged — never silent)
 

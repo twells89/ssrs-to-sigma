@@ -962,15 +962,20 @@ class FakePublishClient:
             else [b"%PDF-1.7\nfixture"]
         )
 
+    def dry_run(self, path, body):
+        self.calls.append(("POST", path, body))
+        return self.verify
+
     def request_json(self, method, path, body=None):
         self.calls.append((method, path, body))
-        if path.endswith("/spec/verify"):
-            return self.verify
-        if method == "POST" and path.endswith("/spec"):
-            kind = "report" if "/reports/" in path else "workbook"
-            return {f"{kind}Id": f"{kind}-1", "success": True}
-        if method == "GET" and "/spec?format=json" in path:
-            return json.loads(json.dumps(self.spec))
+        if method == "POST" and path in ("/v2/workbooks", "/v2/reports"):
+            kind = "report" if path == "/v2/reports" else "workbook"
+            return {f"{kind}Id": f"{kind}-1"}
+        if method == "GET" and "?includeContents=true" in path:
+            # the live readback carries the document under `contents`
+            readback = json.loads(json.dumps(self.spec))
+            readback["contents"] = readback.pop("document")
+            return readback
         if path.endswith("/export"):
             return {"jobComplete": False, "queryId": "query-1"}
         raise AssertionError((method, path))
@@ -1031,7 +1036,15 @@ class PublishHelperTest(unittest.TestCase):
             self.assertFalse(result["created"])
             self.assertEqual(
                 [(call[0], call[1]) for call in fake.calls],
-                [("POST", "/v2/workbooks/spec/verify")],
+                [("POST", "/v2/workbooks")],
+            )
+            body = fake.calls[0][2]
+            self.assertIs(body["dryRun"], True)
+            self.assertEqual(body["name"], "Workbook")
+            self.assertEqual(body["folderId"], "folder")
+            self.assertNotIn("document", body)
+            self.assertEqual(
+                [e["id"] for e in body["contents"]["elements"]], ["title"]
             )
             self.assertTrue(
                 (Path(directory) / "workbook-verify-response.json").is_file()
@@ -1049,9 +1062,14 @@ class PublishHelperTest(unittest.TestCase):
                 (Path(directory) / "workbook-workbook-1-readback.json").is_file()
             )
             self.assertIn(
-                ("GET", "/v2/workbooks/workbook-1/spec?format=json"),
+                ("GET", "/v2/workbooks/workbook-1?includeContents=true"),
                 [(call[0], call[1]) for call in fake.calls],
             )
+            create = [c for c in fake.calls if c[0] == "POST" and "dryRun" not in c[2]]
+            self.assertEqual(len(create), 1)
+            self.assertEqual(create[0][1], "/v2/workbooks")
+            self.assertIn("contents", create[0][2])
+            self.assertNotIn("document", create[0][2])
 
     def test_workbook_readback_missing_layout_element_fails(self):
         spec = self._workbook()
@@ -1132,9 +1150,11 @@ class PublishHelperTest(unittest.TestCase):
             self.assertEqual(pdf.read_bytes(), b"%PDF-1.7\nfixture")
             self.assertEqual(result["pdf"], str(pdf))
             self.assertIn(
-                ("GET", "/v2/reports/report-1/spec?format=json"),
+                ("GET", "/v2/reports/report-1?includeContents=true"),
                 [(call[0], call[1]) for call in fake.calls],
             )
+            self.assertEqual(fake.calls[0][1], "/v2/reports")
+            self.assertIs(fake.calls[0][2]["dryRun"], True)
 
     def test_report_pdf_polling_retries_delayed_readiness(self):
         rep = parse_rdl.parse_rdl(_fixture("PrintLayout2016.rdl"))
@@ -1169,6 +1189,47 @@ class PublishHelperTest(unittest.TestCase):
                     poll_attempts=2,
                 )
         self.assertEqual(sleeps, [0.25])
+
+    def _dry_run_with(self, status, body):
+        env = {
+            "SIGMA_BASE_URL": "https://api.sigmacomputing.com",
+            "SIGMA_API_TOKEN": "token",
+        }
+        with mock.patch.dict(os.environ, env, clear=True), \
+             mock.patch.object(
+                 publish.sigma_rest,
+                 "_send",
+                 return_value=publish.sigma_rest._Resp(
+                     status, json.dumps(body).encode(), "reason"
+                 ),
+             ):
+            publish.sigma_rest.reset_runtime_state()
+            try:
+                return publish.SigmaClient().dry_run(
+                    "/v2/workbooks", {"dryRun": True, "contents": {}}
+                )
+            finally:
+                publish.sigma_rest.reset_runtime_state()
+
+    def test_dry_run_normalizes_live_response_shapes(self):
+        ok = self._dry_run_with(
+            200, {"dryRun": True, "warnings": ["w"], "workbookId": None}
+        )
+        self.assertEqual(ok, {"valid": True, "errors": [], "warnings": ["w"]})
+        bad = self._dry_run_with(400, {
+            "dryRun": True, "valid": False, "warnings": [],
+            "errors": [{"summary": "contents.elements[0]: bad"}],
+        })
+        self.assertIs(bad["valid"], False)
+        self.assertEqual(bad["errors"][0]["summary"], "contents.elements[0]: bad")
+        other = self._dry_run_with(
+            403, {"message": "forbidden", "code": "forbidden"}
+        )
+        self.assertEqual(other["errors"], [{"summary": "forbidden"}])
+        with self.assertRaises(publish.PublishError):
+            self._dry_run_with(500, {"message": "boom"})
+        with self.assertRaises(publish.PublishError):
+            self._dry_run_with(200, {"dryRun": True, "workbookId": "wb-1"})
 
     def test_download_404_is_treated_as_bounded_not_ready(self):
         env = {

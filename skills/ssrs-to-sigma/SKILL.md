@@ -179,8 +179,8 @@ set, and only then removes obsolete workbook/report/resolution artifacts for
 the same `--out-prefix`. A failed rerun preserves the previous valid output
 set, so changing target mode cannot leave a stale publishable spec behind.
 `--report-schema-version` defaults to `1` only for offline compatibility.
-Before a live report verify/create, GET a recent report representation with
-`?format=json`, read its `document.schemaVersion`, and pass that current value;
+Before a live report verify/create, GET a recent report with
+`GET /v2/reports/<id>?includeContents=true`, read its `contents.schemaVersion`, and pass that current value;
 do not assume the offline default matches the target organization.
 
 Emits `sigma_dm_spec.json` (one Custom-SQL element per dataset),
@@ -249,7 +249,7 @@ python3 scripts/convert.py --bundle bundle.json \
   --dm-element-ids dm_element_ids.json \
   --report-schema-version <CURRENT_REPORT_SCHEMA_VERSION>
 
-# Authenticated server verify only; this is the non-persistent default.
+# Authenticated server dry run (`dryRun: true`) only; this is the non-persistent default.
 python3 scripts/publish.py --spec sigma_workbook_spec.json --out-dir publish/wb
 python3 scripts/publish.py --spec sigma_report_spec.json --out-dir publish/report
 
@@ -265,7 +265,7 @@ above, rejects unsafe API origins, saves verify/create responses and readback,
 and checks element/layout coverage where parseable. Bearer requests reject
 redirects so credentials cannot cross origins; report PDF polling treats
 bounded 404/204/processing responses as not-ready.
-Workbook/report GET readback requests JSON explicitly (`?format=json`) and the
+Workbook/report readback (`GET /v2/<kind>s/<id>?includeContents=true`, JSON) and the
 gate compares the complete normalized document; material source, column,
 formula, filter, panel, or layout changes fail. Only response-envelope metadata
 and semantically identical layout XML whitespace are ignored.
@@ -273,8 +273,10 @@ Report PDF export is available only after `--create`; inspect it manually.
 API success is not visual or data parity.
 
 > **Both code-representation surfaces are private beta.**
-> `POST /v2/workbooks/spec`
-> (and its `/verify` sibling) is entitlement-gated — confirm the workspace has
+> `POST /v2/workbooks` and `POST /v2/reports`
+> (the old `/spec` and `/spec/verify` endpoints are deprecated; the document
+> now travels under `contents`, and verify is the same POST with `dryRun: true`)
+> are entitlement-gated — confirm the workspace has
 > it enabled. Reports require their separate entitlement and the caller's
 > **Create, edit, and publish reports** permission. The current report API has
 > no DELETE endpoint, which is why `--create` is mandatory for persistence.
@@ -282,7 +284,7 @@ API success is not visual or data parity.
 > current `{name, folderId, document:{…}}` envelope with flat `elements` +
 > `layout`; the pre-`document` flat body is rejected with HTTP 400. Before
 > POSTing, validate against the live shape with the `sigma-workbooks` skill's
-> `validate-spec.sh` / `POST …/spec/verify` — the field surface (control value
+> `validate-spec.sh` / a `dryRun: true` POST (what `publish.py` does) — the field surface (control value
 > fields, layout tag vocabulary) drifts and the OpenAPI is the source of truth.
 
 Read the workbook spec back the same way; confirm no `type: error` columns and
